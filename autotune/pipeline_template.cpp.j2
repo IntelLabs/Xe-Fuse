@@ -1,0 +1,827 @@
+// Auto-generated xe-fuse pipeline benchmark
+// Model: {{ model_name }}
+// Generated: {{ timestamp }}
+// Architecture: H={{ default_H }}, H_kv={{ default_H_kv }}, I={{ default_I }}
+// Q/K kernel: {{ "K4 (RMSNorm+RoPE)" if use_rope else "K1 (RMSNorm)" }}
+// FFN activation: {{ ffn_activation }}{% if gated_ffn %} (gated, N_ffn=2*I){% else %} (non-gated, N_ffn=I){% endif %}
+//
+// Pipeline: rstd -> {{ pipeline_desc }}
+
+#include "xe-fuse/builder/epilogue_builder.hpp"
+#include "xe-fuse/kernels/gemm_rmsnorm.hpp"
+#include "xe-fuse/kernels/gemm_dual_output.hpp"
+#include "xe-fuse/kernels/compute_rstd.hpp"
+#include "xe-fuse/standalone/ops.hpp"
+#include "xe-fuse/standalone/vllm_ops.hpp"
+{% if use_rope %}
+#include "xe-fuse/kernels/gemm_rmsnorm_rope.hpp"
+{% endif %}
+
+#include "cutlass/util/GPU_Clock.hpp"
+#include "cutlass/util/command_line.h"
+#include "cutlass/util/device_memory.h"
+#include "cutlass/util/packed_stride.hpp"
+#include "cutlass/util/reference/device/gemm_complex.h"
+#include "cutlass/util/reference/device/tensor_compare.h"
+
+#include "sycl_common.hpp"
+#include "helper.h"
+
+#include <random>
+#include <cmath>
+#include <iostream>
+
+using namespace cute;
+using bf16 = cutlass::bfloat16_t;
+namespace b = xe_fuse::builder;
+
+// === Kernel type definitions ===
+
+// Tile shape — autotune-selected or default 256x256x32
+using TileShape = cute::Shape<cute::{{ (tile_shape | default("_256, _256, _32")).replace(", ", ", cute::") }}>;
+
+{% if use_rope %}
+using QK_Config = xe_fuse::GemmRmsNormRoPE<
+    cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t,
+    float, float, float, float, TileShape>;
+{% else %}
+using QK_Config = xe_fuse::GemmRmsNorm<
+    cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t,
+    float, float, float, TileShape>;
+{% endif %}
+using K1_Config = xe_fuse::GemmRmsNorm<
+    cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t,
+    float, float, float, TileShape>;
+using K0_Config = xe_fuse::GemmDualOutput<
+    cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t,
+    cutlass::bfloat16_t, float, float, float, TileShape>;
+
+{% if ffn_activation == "swiglu" %}
+using FFN_EVT = b::SwiGLU<b::ScaleRows<b::Acc, TileShape, float>>;
+{% elif ffn_activation == "geglu" %}
+using FFN_EVT = b::GeGLU<b::ScaleRows<b::Acc, TileShape, float>>;
+{% elif ffn_activation == "gelu" %}
+using FFN_EVT = b::GeLU<b::ScaleRows<b::Acc, TileShape, float>>;
+{% endif %}
+using FFN_Config = b::MakeGemm<FFN_EVT, bf16, bf16, bf16, float, float, TileShape>;
+using FFN_Gemm = typename FFN_Config::Gemm;
+
+struct BareGemm {
+  using ElementA = bf16;
+  using ElementB = bf16;
+  using ElementD = bf16;
+  using ElementAcc = float;
+  using ElementCompute = float;
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::RowMajor;
+  using BTS = TileShape;
+  using StrideC = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+  using StrideD = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Xe20, cutlass::arch::OpClassTensorOp,
+      BTS, cute::Shape<cute::_1, cute::_1, cute::_1>,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAcc, ElementCompute,
+      ElementD, StrideC, 8, ElementD, StrideD, 8,
+      cutlass::epilogue::collective::EpilogueScheduleAuto
+  >::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Xe20, cutlass::arch::OpClassTensorOp,
+      ElementA, LayoutA, 8, ElementB, LayoutB, 8,
+      ElementAcc, BTS, cute::Shape<cute::_1, cute::_1, cute::_1>,
+      cutlass::gemm::collective::StageCountAuto,
+      cutlass::gemm::collective::KernelScheduleAuto
+  >::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      cute::Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+struct Options {
+  int m = 2048;
+  int h = {{ default_H }};
+  int hkv = {{ default_H_kv }};
+  int inter = {{ default_I }};
+  int l = 1;
+  int iterations = 0;
+  float eps = 1e-6f;
+
+  void parse(int argc, const char** args) {
+    cutlass::CommandLine cmd(argc, args);
+    cmd.get_cmd_line_argument("m", m, 2048);
+    cmd.get_cmd_line_argument("h", h, {{ default_H }});
+    cmd.get_cmd_line_argument("hkv", hkv, {{ default_H_kv }});
+    cmd.get_cmd_line_argument("inter", inter, {{ default_I }});
+    cmd.get_cmd_line_argument("l", l, 1);
+    cmd.get_cmd_line_argument("iterations", iterations, 0);
+  }
+};
+
+bool check(const char* name, bf16 const* ref, bf16 const* actual, size_t count,
+           float rtol = 0.05f) {
+  bool ok = cutlass::reference::device::BlockCompareRelativelyEqual(
+    ref, actual, count, static_cast<bf16>(rtol), static_cast<bf16>(rtol));
+  std::cout << "  " << name << ": " << (ok ? "Passed" : "FAILED") << std::endl;
+  return ok;
+}
+
+int main(int argc, const char** argv) {
+  Options opts;
+  opts.parse(argc, argv);
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+  int M = opts.m, H = opts.h, H_kv = opts.hkv, I = opts.inter, L = opts.l;
+{% if gated_ffn %}
+  int N_ffn = 2 * I;
+{% else %}
+  int N_ffn = I;
+{% endif %}
+  auto q = compat::get_default_queue();
+
+  std::cout << "============================================================" << std::endl;
+  std::cout << "xe-fuse: {{ model_name }} Pipeline Test" << std::endl;
+  std::cout << "  M=" << M << " H=" << H << " H_kv=" << H_kv
+            << " I=" << I << " (N_ffn=" << N_ffn << ")" << std::endl;
+  std::cout << "============================================================" << std::endl;
+
+  // === Allocations ===
+  size_t mh = static_cast<size_t>(M) * H * L;
+  size_t mhkv = static_cast<size_t>(M) * H_kv * L;
+  size_t hh = static_cast<size_t>(H) * H * L;
+  size_t h_hkv = static_cast<size_t>(H) * H_kv * L;
+  size_t h_nffn = static_cast<size_t>(H) * N_ffn * L;
+  size_t m_nffn = static_cast<size_t>(M) * N_ffn * L;
+
+  cutlass::DeviceAllocation<bf16> x(mh);
+  cutlass::DeviceAllocation<bf16> W_q(hh);
+  cutlass::DeviceAllocation<bf16> W_v(h_hkv);
+  cutlass::DeviceAllocation<bf16> W_o(hh);
+  cutlass::DeviceAllocation<bf16> W_ffn(h_nffn);
+  cutlass::DeviceAllocation<float> gamma(static_cast<size_t>(H) * L);
+{% if use_rope %}
+  cutlass::DeviceAllocation<float> cos_sin(mh);
+{% endif %}
+
+  cutlass::DeviceAllocation<float> R1(static_cast<size_t>(M) * L);
+  cutlass::DeviceAllocation<bf16> Q_out(mh);
+  cutlass::DeviceAllocation<bf16> V_out(mhkv);
+  cutlass::DeviceAllocation<bf16> attn_out(mh);
+  cutlass::DeviceAllocation<bf16> residual1(mh);
+  cutlass::DeviceAllocation<bf16> raw_sum(mh);
+  cutlass::DeviceAllocation<float> R2(static_cast<size_t>(M) * L);
+  cutlass::DeviceAllocation<bf16> ffn_out(m_nffn);
+
+  size_t max_mn = std::max({mh, mhkv, m_nffn});
+  cutlass::DeviceAllocation<float> ref_f32(max_mn);
+  cutlass::DeviceAllocation<bf16> ref_bf16(max_mn);
+  cutlass::DeviceAllocation<bf16> ref_bf16_aux(mh);
+  cutlass::DeviceAllocation<bf16> tmp_buf(mh);
+
+  initialize_block(x, 2023);
+  initialize_block(W_q, 2024);
+  initialize_block(W_v, 2025);
+  initialize_block(W_o, 2026);
+  initialize_block(W_ffn, 2027);
+  initialize_block(attn_out, 2028);
+
+  {
+    std::vector<float> h_gamma(static_cast<size_t>(H) * L);
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(0.5f, 1.5f);
+    for (auto& v : h_gamma) v = dist(rng);
+    q.memcpy(gamma.get(), h_gamma.data(), h_gamma.size() * sizeof(float));
+  }
+{% if use_rope %}
+  {
+    std::vector<float> h_cs(mh);
+    std::mt19937 rng(2024);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto& v : h_cs) v = dist(rng);
+    q.memcpy(cos_sin.get(), h_cs.data(), h_cs.size() * sizeof(float));
+  }
+{% endif %}
+  compat::wait();
+
+  // === Setup fused GEMM ops ===
+
+  auto stride_A_mh = cutlass::make_cute_packed_stride(
+    typename QK_Config::Gemm::GemmKernel::StrideA{}, make_shape(M, H, L));
+  auto stride_B_hh = cutlass::make_cute_packed_stride(
+    typename QK_Config::Gemm::GemmKernel::StrideB{}, make_shape(H, H, L));
+  auto stride_D_mh = cutlass::make_cute_packed_stride(
+    QK_Config::StrideD{}, make_shape(M, H, L));
+{% if use_rope %}
+  auto stride_cs = cutlass::make_cute_packed_stride(
+    QK_Config::StrideCosSin{}, make_shape(M, H, L));
+{% endif %}
+
+  // Q projection
+  typename QK_Config::Gemm qk_op;
+{% if use_rope %}
+  auto qk_evt = QK_Config::make_evt_args(R1.get(), M, cos_sin.get(), stride_cs);
+{% else %}
+  auto qk_evt = QK_Config::make_evt_args(R1.get(), M);
+{% endif %}
+  typename QK_Config::Gemm::GemmKernel::EpilogueArguments qk_epi{
+    qk_evt, nullptr, stride_D_mh, Q_out.get(), stride_D_mh};
+  typename QK_Config::Gemm::GemmKernel::Arguments qk_args{
+    cutlass::gemm::GemmUniversalMode::kGemm,
+    {M, H, H, L},
+    {x.get(), stride_A_mh, W_q.get(), stride_B_hh},
+    qk_epi, hw_info};
+  cutlass::device_memory::allocation<uint8_t> qk_ws(QK_Config::Gemm::get_workspace_size(qk_args));
+  CUTLASS_CHECK(qk_op.can_implement(qk_args));
+  CUTLASS_CHECK(qk_op.initialize(qk_args, qk_ws.get()));
+
+  // V projection
+  auto stride_A_v = cutlass::make_cute_packed_stride(
+    typename K1_Config::Gemm::GemmKernel::StrideA{}, make_shape(M, H, L));
+  auto stride_B_hkv = cutlass::make_cute_packed_stride(
+    typename K1_Config::Gemm::GemmKernel::StrideB{}, make_shape(H_kv, H, L));
+  auto stride_D_hkv = cutlass::make_cute_packed_stride(
+    K1_Config::StrideD{}, make_shape(M, H_kv, L));
+
+  typename K1_Config::Gemm k1_op;
+  auto k1_evt = K1_Config::make_evt_args(R1.get(), M);
+  typename K1_Config::Gemm::GemmKernel::EpilogueArguments k1_epi{
+    k1_evt, nullptr, stride_D_hkv, V_out.get(), stride_D_hkv};
+  typename K1_Config::Gemm::GemmKernel::Arguments k1_args{
+    cutlass::gemm::GemmUniversalMode::kGemm,
+    {M, H_kv, H, L},
+    {x.get(), stride_A_v, W_v.get(), stride_B_hkv},
+    k1_epi, hw_info};
+  cutlass::device_memory::allocation<uint8_t> k1_ws(K1_Config::Gemm::get_workspace_size(k1_args));
+  CUTLASS_CHECK(k1_op.can_implement(k1_args));
+  CUTLASS_CHECK(k1_op.initialize(k1_args, k1_ws.get()));
+
+  // O projection (K0)
+  auto stride_A_o = cutlass::make_cute_packed_stride(
+    typename K0_Config::Gemm::GemmKernel::StrideA{}, make_shape(M, H, L));
+  auto stride_B_o = cutlass::make_cute_packed_stride(
+    typename K0_Config::Gemm::GemmKernel::StrideB{}, make_shape(H, H, L));
+  auto stride_aux = cutlass::make_cute_packed_stride(
+    K0_Config::StrideAux{}, make_shape(M, H, L));
+
+  typename K0_Config::Gemm k0_op;
+  auto k0_evt = K0_Config::make_evt_args(
+    x.get(), stride_D_mh, gamma.get(), H, raw_sum.get(), stride_aux);
+  typename K0_Config::Gemm::GemmKernel::EpilogueArguments k0_epi{
+    k0_evt, nullptr, stride_D_mh, residual1.get(), stride_D_mh};
+  typename K0_Config::Gemm::GemmKernel::Arguments k0_args{
+    cutlass::gemm::GemmUniversalMode::kGemm,
+    {M, H, H, L},
+    {attn_out.get(), stride_A_o, W_o.get(), stride_B_o},
+    k0_epi, hw_info};
+  cutlass::device_memory::allocation<uint8_t> k0_ws(K0_Config::Gemm::get_workspace_size(k0_args));
+  CUTLASS_CHECK(k0_op.can_implement(k0_args));
+  CUTLASS_CHECK(k0_op.initialize(k0_args, k0_ws.get()));
+
+  // FFN projection
+  auto stride_A_ffn = cutlass::make_cute_packed_stride(
+    typename FFN_Gemm::GemmKernel::StrideA{}, make_shape(M, H, L));
+  auto stride_B_ffn = cutlass::make_cute_packed_stride(
+    typename FFN_Gemm::GemmKernel::StrideB{}, make_shape(N_ffn, H, L));
+  auto stride_D_ffn = cutlass::make_cute_packed_stride(
+    FFN_Config::StrideD{}, make_shape(M, N_ffn, L));
+
+  typename b::Acc::Arguments ffn_acc{};
+  typename b::ColBroadcast<0, TileShape, float>::Arguments ffn_scale;
+  ffn_scale.ptr_col = R2.get();
+  ffn_scale.null_default = float(1);
+  ffn_scale.dCol = {cute::Int<1>{}, cute::Int<0>{}, static_cast<int64_t>(M)};
+  typename b::MulOp<float, float>::Arguments ffn_mul{};
+  typename b::ScaleRows<b::Acc, TileShape, float>::Arguments ffn_rms{ffn_acc, ffn_scale, ffn_mul};
+{% if ffn_activation == "swiglu" %}
+  typename xe_fuse::XePairwiseCompute<xe_fuse::SwiGLUFn>::Arguments ffn_act{};
+{% elif ffn_activation == "geglu" %}
+  typename xe_fuse::XePairwiseCompute<xe_fuse::GeGLUFn>::Arguments ffn_act{};
+{% elif ffn_activation == "gelu" %}
+  typename xe_fuse::XeElementwiseCompute<xe_fuse::GeLUFn>::Arguments ffn_act{};
+{% endif %}
+  typename FFN_EVT::Arguments ffn_evt{ffn_rms, ffn_act};
+
+  FFN_Gemm ffn_op;
+  typename FFN_Gemm::GemmKernel::EpilogueArguments ffn_epi{
+    ffn_evt, nullptr, stride_D_ffn, ffn_out.get(), stride_D_ffn};
+  typename FFN_Gemm::GemmKernel::Arguments ffn_args{
+    cutlass::gemm::GemmUniversalMode::kGemm,
+    {M, N_ffn, H, L},
+    {residual1.get(), stride_A_ffn, W_ffn.get(), stride_B_ffn},
+    ffn_epi, hw_info};
+  cutlass::device_memory::allocation<uint8_t> ffn_ws(FFN_Gemm::get_workspace_size(ffn_args));
+  CUTLASS_CHECK(ffn_op.can_implement(ffn_args));
+  CUTLASS_CHECK(ffn_op.initialize(ffn_args, ffn_ws.get()));
+
+  // === Run fused pipeline ===
+  std::cout << "\n=== Running fused pipeline ===" << std::endl;
+
+  xe_fuse::launch_compute_rstd(q, x.get(), R1.get(), M, H, L, opts.eps);
+  compat::wait();
+  CUTLASS_CHECK(qk_op.run());
+  CUTLASS_CHECK(k1_op.run());
+  compat::wait();
+  CUTLASS_CHECK(k0_op.run());
+  compat::wait();
+  xe_fuse::launch_compute_rstd(q, raw_sum.get(), R2.get(), M, H, L, opts.eps);
+  compat::wait();
+  CUTLASS_CHECK(ffn_op.run());
+  compat::wait();
+
+  std::cout << "Pipeline complete.\n" << std::endl;
+
+  // === Verify each step ===
+  bool all_passed = true;
+
+{% if use_rope %}
+  std::cout << "--- Q = K4(x @ W_q, R1, cos_sin) ---" << std::endl;
+{% else %}
+  std::cout << "--- Q = K1(x @ W_q, R1) ---" << std::endl;
+{% endif %}
+  {
+    cutlass::TensorRef rA(x.get(), cutlass::layout::RowMajor::packed({M, H}));
+    cutlass::TensorRef rB(W_q.get(), cutlass::layout::RowMajor::packed({H, H}));
+    cutlass::TensorRef rC(ref_f32.get(), cutlass::layout::RowMajor::packed({M, H}));
+    cutlass::TensorRef rD(ref_f32.get(), cutlass::layout::RowMajor::packed({M, H}));
+    cutlass::reference::device::GemmComplex(
+      {M, H, H}, 1.0f, rA, cutlass::ComplexTransform::kNone,
+      rB, cutlass::ComplexTransform::kNone, 0.0f, rC, rD, 0.0f,
+      L, M*H, H*H, M*H, M*H);
+    compat::wait();
+
+    auto* gemm = ref_f32.get();
+    auto* r1 = R1.get();
+    auto* out = ref_bf16.get();
+    int h_val = H;
+{% if use_rope %}
+    auto* cs = cos_sin.get();
+    q.parallel_for(sycl::range<1>(mh), [=](sycl::id<1> idx) {
+      int64_t i = idx[0];
+      int row = static_cast<int>(i / h_val);
+      int col = static_cast<int>(i % h_val);
+      int pair_base = (col / 2) * 2;
+      int64_t even_idx = static_cast<int64_t>(row) * h_val + pair_base;
+      int64_t odd_idx = even_idx + 1;
+      float even_scaled = gemm[even_idx] * r1[row];
+      float odd_scaled = gemm[odd_idx] * r1[row];
+      float cos_v = cs[even_idx];
+      float sin_v = cs[odd_idx];
+      float result = (col % 2 == 0)
+        ? ( even_scaled * cos_v + odd_scaled * sin_v)
+        : (-even_scaled * sin_v + odd_scaled * cos_v);
+      out[i] = static_cast<bf16>(result);
+    });
+{% else %}
+    q.parallel_for(sycl::range<1>(mh), [=](sycl::id<1> idx) {
+      int64_t i = idx[0];
+      int row = static_cast<int>(i / h_val);
+      out[i] = static_cast<bf16>(gemm[i] * r1[row]);
+    });
+{% endif %}
+    compat::wait();
+    all_passed &= check("{{ 'K4 (GEMM+RMSNorm+RoPE)' if use_rope else 'K1 (GEMM+RMSNorm)' }} -> Q",
+                         ref_bf16.get(), Q_out.get(), mh);
+  }
+
+  std::cout << "--- V = K1(x @ W_v, R1) ---" << std::endl;
+  {
+    cutlass::TensorRef rA(x.get(), cutlass::layout::RowMajor::packed({M, H}));
+    cutlass::TensorRef rB(W_v.get(), cutlass::layout::RowMajor::packed({H, H_kv}));
+    cutlass::TensorRef rC(ref_f32.get(), cutlass::layout::RowMajor::packed({M, H_kv}));
+    cutlass::TensorRef rD(ref_f32.get(), cutlass::layout::RowMajor::packed({M, H_kv}));
+    cutlass::reference::device::GemmComplex(
+      {M, H_kv, H}, 1.0f, rA, cutlass::ComplexTransform::kNone,
+      rB, cutlass::ComplexTransform::kNone, 0.0f, rC, rD, 0.0f,
+      L, M*H, H*H_kv, M*H_kv, M*H_kv);
+    compat::wait();
+
+    auto* gemm = ref_f32.get();
+    auto* r1 = R1.get();
+    auto* out = ref_bf16.get();
+    int n_val = H_kv;
+    q.parallel_for(sycl::range<1>(mhkv), [=](sycl::id<1> idx) {
+      int64_t i = idx[0];
+      int row = static_cast<int>(i / n_val);
+      out[i] = static_cast<bf16>(gemm[i] * r1[row]);
+    });
+    compat::wait();
+    all_passed &= check("K1 (GEMM+RMSNorm) -> V", ref_bf16.get(), V_out.get(), mhkv);
+  }
+
+  std::cout << "--- K0(attn_out @ W_o + x) -> residual1, raw_sum ---" << std::endl;
+  {
+    cutlass::TensorRef rA(attn_out.get(), cutlass::layout::RowMajor::packed({M, H}));
+    cutlass::TensorRef rB(W_o.get(), cutlass::layout::RowMajor::packed({H, H}));
+    cutlass::TensorRef rC(ref_f32.get(), cutlass::layout::RowMajor::packed({M, H}));
+    cutlass::TensorRef rD(ref_f32.get(), cutlass::layout::RowMajor::packed({M, H}));
+    cutlass::reference::device::GemmComplex(
+      {M, H, H}, 1.0f, rA, cutlass::ComplexTransform::kNone,
+      rB, cutlass::ComplexTransform::kNone, 0.0f, rC, rD, 0.0f,
+      L, M*H, H*H, M*H, M*H);
+    compat::wait();
+
+    auto* gemm = ref_f32.get();
+    auto* x_ptr = x.get();
+    auto* gamma_ptr = gamma.get();
+    auto* ref_d = ref_bf16.get();
+    auto* ref_a = ref_bf16_aux.get();
+    int h_val = H;
+    q.parallel_for(sycl::range<1>(mh), [=](sycl::id<1> idx) {
+      int64_t i = idx[0];
+      int col = static_cast<int>(i % h_val);
+      float sum = gemm[i] + static_cast<float>(x_ptr[i]);
+      ref_a[i] = static_cast<bf16>(sum);
+      ref_d[i] = static_cast<bf16>(sum * gamma_ptr[col]);
+    });
+    compat::wait();
+    all_passed &= check("K0 primary D (gamma * sum)", ref_bf16.get(), residual1.get(), mh);
+    all_passed &= check("K0 aux (raw sum)", ref_bf16_aux.get(), raw_sum.get(), mh);
+  }
+
+  std::cout << "--- FFN = K2(residual1 @ W_ffn, R2) [{{ ffn_activation }}] ---" << std::endl;
+  {
+    cutlass::TensorRef rA(residual1.get(), cutlass::layout::RowMajor::packed({M, H}));
+    cutlass::TensorRef rB(W_ffn.get(), cutlass::layout::RowMajor::packed({H, N_ffn}));
+    cutlass::TensorRef rC(ref_f32.get(), cutlass::layout::RowMajor::packed({M, N_ffn}));
+    cutlass::TensorRef rD(ref_f32.get(), cutlass::layout::RowMajor::packed({M, N_ffn}));
+    cutlass::reference::device::GemmComplex(
+      {M, N_ffn, H}, 1.0f, rA, cutlass::ComplexTransform::kNone,
+      rB, cutlass::ComplexTransform::kNone, 0.0f, rC, rD, 0.0f,
+      L, M*H, H*N_ffn, M*N_ffn, M*N_ffn);
+    compat::wait();
+
+    auto* gemm = ref_f32.get();
+    auto* r2 = R2.get();
+    auto* out = ref_bf16.get();
+    int n_val = N_ffn;
+{% if gated_ffn %}
+    q.parallel_for(sycl::range<1>(m_nffn), [=](sycl::id<1> idx) {
+      int64_t i = idx[0];
+      int row = static_cast<int>(i / n_val);
+      int col = static_cast<int>(i % n_val);
+      int pair_base = (col / 2) * 2;
+      int64_t gate_idx = static_cast<int64_t>(row) * n_val + pair_base;
+      int64_t up_idx = gate_idx + 1;
+      float gate = gemm[gate_idx] * r2[row];
+      float up = gemm[up_idx] * r2[row];
+{% if ffn_activation == "swiglu" %}
+      float act = gate / (1.0f + sycl::exp(-gate));
+{% elif ffn_activation == "geglu" %}
+      float act = gate * 0.5f * (1.0f + sycl::erf(gate * 0.7071067811865475f));
+{% endif %}
+      out[i] = static_cast<bf16>(act * up);
+    });
+{% else %}
+    q.parallel_for(sycl::range<1>(m_nffn), [=](sycl::id<1> idx) {
+      int64_t i = idx[0];
+      int row = static_cast<int>(i / n_val);
+      float val = gemm[i] * r2[row];
+      out[i] = static_cast<bf16>(val * 0.5f * (1.0f + sycl::erf(val * 0.7071067811865475f)));
+    });
+{% endif %}
+    compat::wait();
+    all_passed &= check("FFN ({{ ffn_activation }}) -> ffn_out", ref_bf16.get(), ffn_out.get(), m_nffn);
+  }
+
+  std::cout << "\n============================================================" << std::endl;
+  std::cout << "Pipeline: " << (all_passed ? "ALL PASSED" : "SOME FAILED") << std::endl;
+  std::cout << "============================================================" << std::endl;
+
+  // === Benchmark ===
+  if (opts.iterations > 0) {
+    std::cout << "\n=== Benchmark: " << opts.iterations << " iterations ===" << std::endl;
+    std::cout << "Pipeline: " << M << "x" << H << " hidden, " << I << " intermediate\n" << std::endl;
+
+    double flops = 2.0 * M * L *
+      (static_cast<double>(H) * H +
+       static_cast<double>(H_kv) * H +
+       static_cast<double>(H) * H +
+       static_cast<double>(N_ffn) * H);
+
+    // Fused warmup
+    xe_fuse::launch_compute_rstd(q, x.get(), R1.get(), M, H, L, opts.eps);
+    qk_op.run(); k1_op.run(); k0_op.run();
+    xe_fuse::launch_compute_rstd(q, raw_sum.get(), R2.get(), M, H, L, opts.eps);
+    ffn_op.run();
+    compat::wait();
+
+    GPU_Clock timer;
+    timer.start();
+    for (int i = 0; i < opts.iterations; ++i) {
+      xe_fuse::launch_compute_rstd(q, x.get(), R1.get(), M, H, L, opts.eps);
+      qk_op.run(); k1_op.run(); k0_op.run();
+      xe_fuse::launch_compute_rstd(q, raw_sum.get(), R2.get(), M, H, L, opts.eps);
+      ffn_op.run();
+    }
+    compat::wait();
+    float fused_s = timer.seconds() / opts.iterations;
+
+    printf("Fused pipeline (GEMM + epilogue):\n");
+    printf("  Time: %.4f ms\n", fused_s * 1000);
+    printf("  Aggregate: %.3f TFlop/s\n", flops * 1e-12 / fused_s);
+
+    // --- vllm-equiv pipeline ---
+    // Uses the same bare GEMM from sycl-tla but with vllm-style fused
+    // standalone kernels between GEMMs (fused_add_rms_norm, silu_and_mul, etc.)
+    // This isolates the fusion strategy difference: INTO epilogue vs BETWEEN GEMMs.
+    float vllm_s = 0.0f;
+    {
+      using BareOp = typename BareGemm::Gemm;
+      using BareKernel = typename BareGemm::Gemm::GemmKernel;
+
+      auto bare_sA_mh = cutlass::make_cute_packed_stride(
+        typename BareKernel::StrideA{}, make_shape(M, H, L));
+      auto bare_sB_hh = cutlass::make_cute_packed_stride(
+        typename BareKernel::StrideB{}, make_shape(H, H, L));
+      auto bare_sD_mh = cutlass::make_cute_packed_stride(
+        BareGemm::StrideD{}, make_shape(M, H, L));
+      auto bare_sB_hkv = cutlass::make_cute_packed_stride(
+        typename BareKernel::StrideB{}, make_shape(H_kv, H, L));
+      auto bare_sD_hkv = cutlass::make_cute_packed_stride(
+        BareGemm::StrideD{}, make_shape(M, H_kv, L));
+      auto bare_sB_ffn = cutlass::make_cute_packed_stride(
+        typename BareKernel::StrideB{}, make_shape(N_ffn, H, L));
+      auto bare_sD_ffn = cutlass::make_cute_packed_stride(
+        BareGemm::StrideD{}, make_shape(M, N_ffn, L));
+
+      // vllm needs RMSNorm weight vectors (bf16, matches vllm convention)
+      cutlass::DeviceAllocation<bf16> norm_weight1(static_cast<size_t>(H));
+      cutlass::DeviceAllocation<bf16> norm_weight2(static_cast<size_t>(H));
+      {
+        std::vector<bf16> hw(H);
+        std::mt19937 rng(99);
+        std::uniform_real_distribution<float> dist(0.8f, 1.2f);
+        for (auto& v : hw) v = static_cast<bf16>(dist(rng));
+        q.memcpy(norm_weight1.get(), hw.data(), hw.size() * sizeof(bf16));
+        q.memcpy(norm_weight2.get(), hw.data(), hw.size() * sizeof(bf16));
+        compat::wait();
+      }
+
+      // Q GEMM: x @ W_q -> tmp_buf [M, H]
+      typename BareKernel::Arguments vq_args{
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, H, H, L},
+        {x.get(), bare_sA_mh, W_q.get(), bare_sB_hh},
+        { {1.0f, 0.0f}, nullptr, bare_sD_mh, tmp_buf.get(), bare_sD_mh},
+        hw_info};
+      // V GEMM: x @ W_v -> V_out [M, H_kv]
+      typename BareKernel::Arguments vv_args{
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, H_kv, H, L},
+        {x.get(), bare_sA_mh, W_v.get(), bare_sB_hkv},
+        { {1.0f, 0.0f}, nullptr, bare_sD_hkv, V_out.get(), bare_sD_hkv},
+        hw_info};
+      // O GEMM: attn_out @ W_o -> residual1 [M, H]
+      typename BareKernel::Arguments vo_args{
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, H, H, L},
+        {attn_out.get(), bare_sA_mh, W_o.get(), bare_sB_hh},
+        { {1.0f, 0.0f}, nullptr, bare_sD_mh, residual1.get(), bare_sD_mh},
+        hw_info};
+      // FFN GEMM: input @ W_ffn -> ffn_out [M, N_ffn]
+      typename BareKernel::Arguments vffn_args{
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, N_ffn, H, L},
+        {residual1.get(), bare_sA_mh, W_ffn.get(), bare_sB_ffn},
+        { {1.0f, 0.0f}, nullptr, bare_sD_ffn, ffn_out.get(), bare_sD_ffn},
+        hw_info};
+
+      BareOp vq_op, vv_op, vo_op, vffn_op;
+      cutlass::device_memory::allocation<uint8_t> ws_vq(BareOp::get_workspace_size(vq_args));
+      cutlass::device_memory::allocation<uint8_t> ws_vv(BareOp::get_workspace_size(vv_args));
+      cutlass::device_memory::allocation<uint8_t> ws_vo(BareOp::get_workspace_size(vo_args));
+      cutlass::device_memory::allocation<uint8_t> ws_vffn(BareOp::get_workspace_size(vffn_args));
+      CUTLASS_CHECK(vq_op.can_implement(vq_args));
+      CUTLASS_CHECK(vq_op.initialize(vq_args, ws_vq.get()));
+      CUTLASS_CHECK(vv_op.can_implement(vv_args));
+      CUTLASS_CHECK(vv_op.initialize(vv_args, ws_vv.get()));
+      CUTLASS_CHECK(vo_op.can_implement(vo_args));
+      CUTLASS_CHECK(vo_op.initialize(vo_args, ws_vo.get()));
+      CUTLASS_CHECK(vffn_op.can_implement(vffn_args));
+      CUTLASS_CHECK(vffn_op.initialize(vffn_args, ws_vffn.get()));
+
+      // cos_sin cache for vllm RoPE: [M, rot_dim] with cos in first half, sin in second
+{% if use_rope %}
+      int head_dim = 128;
+      int num_q_heads = H / head_dim;
+      int num_kv_heads_rope = H_kv / head_dim;
+      int rot_dim = head_dim;
+      cutlass::DeviceAllocation<float> vllm_cos_sin(static_cast<size_t>(M) * rot_dim);
+      {
+        std::vector<float> hcs(static_cast<size_t>(M) * rot_dim);
+        std::mt19937 rng(2024);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (auto& v : hcs) v = dist(rng);
+        q.memcpy(vllm_cos_sin.get(), hcs.data(), hcs.size() * sizeof(float));
+        compat::wait();
+      }
+{% endif %}
+
+      // Warmup
+      xe_fuse::vllm_equiv::rms_norm(q, tmp_buf.get(), x.get(), norm_weight1.get(), M, H, opts.eps);
+      compat::wait();
+      CUTLASS_CHECK(vq_op.run());
+      compat::wait();
+{% if use_rope %}
+      xe_fuse::vllm_equiv::rotary_embedding(q, tmp_buf.get(), nullptr,
+        vllm_cos_sin.get(), head_dim, num_q_heads, num_kv_heads_rope, rot_dim, M);
+{% endif %}
+      CUTLASS_CHECK(vv_op.run());
+      compat::wait();
+      xe_fuse::vllm_equiv::rms_norm(q, V_out.get(), V_out.get(), norm_weight1.get(), M, H_kv, opts.eps);
+      compat::wait();
+      CUTLASS_CHECK(vo_op.run());
+      compat::wait();
+      xe_fuse::vllm_equiv::fused_add_rms_norm(q, residual1.get(), x.get(),
+        norm_weight2.get(), M, H, opts.eps);
+      compat::wait();
+      CUTLASS_CHECK(vffn_op.run());
+      compat::wait();
+{% if ffn_activation == "swiglu" %}
+      xe_fuse::vllm_equiv::silu_and_mul(q, ffn_out.get(), ffn_out.get(), I, M);
+{% elif ffn_activation == "geglu" %}
+      xe_fuse::vllm_equiv::gelu_and_mul(q, ffn_out.get(), ffn_out.get(), I, M);
+{% endif %}
+      compat::wait();
+
+      // Timed loop
+      timer.start();
+      for (int i = 0; i < opts.iterations; ++i) {
+        // RMSNorm on input (pre-Q/V)
+        xe_fuse::vllm_equiv::rms_norm(q, tmp_buf.get(), x.get(), norm_weight1.get(), M, H, opts.eps);
+        // Q projection
+        CUTLASS_CHECK(vq_op.run());
+{% if use_rope %}
+        // RoPE on Q (NeoX-style, head_dim=128)
+        xe_fuse::vllm_equiv::rotary_embedding(q, tmp_buf.get(), nullptr,
+          vllm_cos_sin.get(), head_dim, num_q_heads, num_kv_heads_rope, rot_dim, M);
+{% endif %}
+        // V projection
+        CUTLASS_CHECK(vv_op.run());
+        // RMSNorm on V
+        xe_fuse::vllm_equiv::rms_norm(q, V_out.get(), V_out.get(), norm_weight1.get(), M, H_kv, opts.eps);
+        // O projection
+        CUTLASS_CHECK(vo_op.run());
+        // fused_add_rms_norm: residual add + RMSNorm for FFN input
+        xe_fuse::vllm_equiv::fused_add_rms_norm(q, residual1.get(), x.get(),
+          norm_weight2.get(), M, H, opts.eps);
+        // FFN GEMM
+        CUTLASS_CHECK(vffn_op.run());
+        // silu_and_mul / gelu_and_mul (contiguous halves -> half-width output)
+{% if ffn_activation == "swiglu" %}
+        xe_fuse::vllm_equiv::silu_and_mul(q, ffn_out.get(), ffn_out.get(), I, M);
+{% elif ffn_activation == "geglu" %}
+        xe_fuse::vllm_equiv::gelu_and_mul(q, ffn_out.get(), ffn_out.get(), I, M);
+{% elif ffn_activation == "gelu" %}
+        xe_fuse::standalone::gelu(q, ffn_out.get(), M, N_ffn, L);
+{% endif %}
+      }
+      compat::wait();
+      vllm_s = timer.seconds() / opts.iterations;
+
+      printf("\nvllm-equiv pipeline (bare GEMM + fused standalone ops):\n");
+      printf("  Time: %.4f ms\n", vllm_s * 1000);
+      printf("  Aggregate: %.3f TFlop/s\n", flops * 1e-12 / vllm_s);
+      printf("  Ops: rms_norm + GEMM + RoPE + GEMM + rms_norm + GEMM + fused_add_rms_norm + GEMM + {{ ffn_activation }}\n");
+    }
+
+    // --- Unfused pipeline ---
+    using BareOp = typename BareGemm::Gemm;
+    using BareKernel = typename BareGemm::Gemm::GemmKernel;
+
+    auto bare_sA_mh = cutlass::make_cute_packed_stride(
+      typename BareKernel::StrideA{}, make_shape(M, H, L));
+    auto bare_sB_hh = cutlass::make_cute_packed_stride(
+      typename BareKernel::StrideB{}, make_shape(H, H, L));
+    auto bare_sD_mh = cutlass::make_cute_packed_stride(
+      BareGemm::StrideD{}, make_shape(M, H, L));
+    auto bare_sB_hkv = cutlass::make_cute_packed_stride(
+      typename BareKernel::StrideB{}, make_shape(H_kv, H, L));
+    auto bare_sD_hkv = cutlass::make_cute_packed_stride(
+      BareGemm::StrideD{}, make_shape(M, H_kv, L));
+    auto bare_sB_ffn = cutlass::make_cute_packed_stride(
+      typename BareKernel::StrideB{}, make_shape(N_ffn, H, L));
+    auto bare_sD_ffn = cutlass::make_cute_packed_stride(
+      BareGemm::StrideD{}, make_shape(M, N_ffn, L));
+
+    typename BareKernel::Arguments args_bq{
+      cutlass::gemm::GemmUniversalMode::kGemm, {M, H, H, L},
+      {x.get(), bare_sA_mh, W_q.get(), bare_sB_hh},
+      { {1.0f, 0.0f}, nullptr, bare_sD_mh, tmp_buf.get(), bare_sD_mh},
+      hw_info};
+    typename BareKernel::Arguments args_bv{
+      cutlass::gemm::GemmUniversalMode::kGemm, {M, H_kv, H, L},
+      {x.get(), bare_sA_mh, W_v.get(), bare_sB_hkv},
+      { {1.0f, 0.0f}, nullptr, bare_sD_hkv, V_out.get(), bare_sD_hkv},
+      hw_info};
+    typename BareKernel::Arguments args_bo{
+      cutlass::gemm::GemmUniversalMode::kGemm, {M, H, H, L},
+      {attn_out.get(), bare_sA_mh, W_o.get(), bare_sB_hh},
+      { {1.0f, 0.0f}, nullptr, bare_sD_mh, residual1.get(), bare_sD_mh},
+      hw_info};
+    typename BareKernel::Arguments args_bffn{
+      cutlass::gemm::GemmUniversalMode::kGemm, {M, N_ffn, H, L},
+      {residual1.get(), bare_sA_mh, W_ffn.get(), bare_sB_ffn},
+      { {1.0f, 0.0f}, nullptr, bare_sD_ffn, ffn_out.get(), bare_sD_ffn},
+      hw_info};
+
+    BareOp bare_q_op, bare_v_op, bare_o_op, bare_ffn_op;
+    cutlass::device_memory::allocation<uint8_t> ws_bq(BareOp::get_workspace_size(args_bq));
+    cutlass::device_memory::allocation<uint8_t> ws_bv(BareOp::get_workspace_size(args_bv));
+    cutlass::device_memory::allocation<uint8_t> ws_bo(BareOp::get_workspace_size(args_bo));
+    cutlass::device_memory::allocation<uint8_t> ws_bffn(BareOp::get_workspace_size(args_bffn));
+    CUTLASS_CHECK(bare_q_op.can_implement(args_bq));
+    CUTLASS_CHECK(bare_q_op.initialize(args_bq, ws_bq.get()));
+    CUTLASS_CHECK(bare_v_op.can_implement(args_bv));
+    CUTLASS_CHECK(bare_v_op.initialize(args_bv, ws_bv.get()));
+    CUTLASS_CHECK(bare_o_op.can_implement(args_bo));
+    CUTLASS_CHECK(bare_o_op.initialize(args_bo, ws_bo.get()));
+    CUTLASS_CHECK(bare_ffn_op.can_implement(args_bffn));
+    CUTLASS_CHECK(bare_ffn_op.initialize(args_bffn, ws_bffn.get()));
+
+    size_t mh_bytes = mh * sizeof(bf16);
+
+    // Unfused warmup
+    xe_fuse::launch_compute_rstd(q, x.get(), R1.get(), M, H, L, opts.eps);
+    bare_q_op.run();
+    xe_fuse::standalone::scale_rows(q, tmp_buf.get(), R1.get(), M, H, L);
+{% if use_rope %}
+    xe_fuse::standalone::rope(q, Q_out.get(), tmp_buf.get(), cos_sin.get(), M, H, L);
+{% else %}
+    q.memcpy(Q_out.get(), tmp_buf.get(), mh_bytes);
+{% endif %}
+    bare_v_op.run();
+    xe_fuse::standalone::scale_rows(q, V_out.get(), R1.get(), M, H_kv, L);
+    bare_o_op.run();
+    xe_fuse::standalone::add_residual(q, residual1.get(), x.get(), M, H, L);
+    q.memcpy(raw_sum.get(), residual1.get(), mh_bytes);
+    xe_fuse::standalone::scale_cols(q, residual1.get(), gamma.get(), M, H, L);
+    xe_fuse::launch_compute_rstd(q, raw_sum.get(), R2.get(), M, H, L, opts.eps);
+    bare_ffn_op.run();
+    xe_fuse::standalone::scale_rows(q, ffn_out.get(), R2.get(), M, N_ffn, L);
+{% if ffn_activation == "swiglu" %}
+    xe_fuse::standalone::swiglu(q, ffn_out.get(), M, N_ffn, L);
+{% elif ffn_activation == "geglu" %}
+    xe_fuse::standalone::geglu(q, ffn_out.get(), M, N_ffn, L);
+{% elif ffn_activation == "gelu" %}
+    xe_fuse::standalone::gelu(q, ffn_out.get(), M, N_ffn, L);
+{% endif %}
+    compat::wait();
+
+    timer.start();
+    for (int i = 0; i < opts.iterations; ++i) {
+      xe_fuse::launch_compute_rstd(q, x.get(), R1.get(), M, H, L, opts.eps);
+      bare_q_op.run();
+      xe_fuse::standalone::scale_rows(q, tmp_buf.get(), R1.get(), M, H, L);
+{% if use_rope %}
+      xe_fuse::standalone::rope(q, Q_out.get(), tmp_buf.get(), cos_sin.get(), M, H, L);
+{% else %}
+      q.memcpy(Q_out.get(), tmp_buf.get(), mh_bytes);
+{% endif %}
+      bare_v_op.run();
+      xe_fuse::standalone::scale_rows(q, V_out.get(), R1.get(), M, H_kv, L);
+      bare_o_op.run();
+      xe_fuse::standalone::add_residual(q, residual1.get(), x.get(), M, H, L);
+      q.memcpy(raw_sum.get(), residual1.get(), mh_bytes);
+      xe_fuse::standalone::scale_cols(q, residual1.get(), gamma.get(), M, H, L);
+      xe_fuse::launch_compute_rstd(q, raw_sum.get(), R2.get(), M, H, L, opts.eps);
+      bare_ffn_op.run();
+      xe_fuse::standalone::scale_rows(q, ffn_out.get(), R2.get(), M, N_ffn, L);
+{% if ffn_activation == "swiglu" %}
+      xe_fuse::standalone::swiglu(q, ffn_out.get(), M, N_ffn, L);
+{% elif ffn_activation == "geglu" %}
+      xe_fuse::standalone::geglu(q, ffn_out.get(), M, N_ffn, L);
+{% elif ffn_activation == "gelu" %}
+      xe_fuse::standalone::gelu(q, ffn_out.get(), M, N_ffn, L);
+{% endif %}
+    }
+    compat::wait();
+    float unfused_s = timer.seconds() / opts.iterations;
+
+    printf("\nUnfused pipeline (bare GEMM + standalone ops):\n");
+    printf("  Time: %.4f ms\n", unfused_s * 1000);
+    printf("  Aggregate: %.3f TFlop/s\n", flops * 1e-12 / unfused_s);
+
+    float speedup = unfused_s / fused_s;
+    float savings = (1.0f - fused_s / unfused_s) * 100.0f;
+    printf("\nFusion speedup vs naive: %.2fx (fused saves %.1f%% of pipeline time)\n", speedup, savings);
+    std::cout << "Note: K projection omitted (same kernel as Q)" << std::endl;
+
+    // Structured output for LLM agent parsing
+    std::cout << "\n=== STRUCTURED OUTPUT ===" << std::endl;
+    std::cout << "PIPELINE: {{ preset_name }}" << std::endl;
+    std::cout << "MODEL: {{ model_name }}" << std::endl;
+    printf("DIMS: M=%d H=%d H_kv=%d I=%d N_ffn=%d\n", M, H, H_kv, I, N_ffn);
+    std::cout << "CORRECTNESS: " << (all_passed ? "ALL_PASSED" : "SOME_FAILED") << std::endl;
+    printf("FUSED: %.4f ms %.3f TFlop/s\n", fused_s * 1000, flops * 1e-12 / fused_s);
+    printf("VLLM_EQUIV: %.4f ms %.3f TFlop/s\n", vllm_s * 1000, flops * 1e-12 / vllm_s);
+    printf("UNFUSED: %.4f ms %.3f TFlop/s\n", unfused_s * 1000, flops * 1e-12 / unfused_s);
+    printf("XE_VS_VLLM: %.2fx\n", vllm_s / fused_s);
+    printf("XE_VS_NAIVE: %.2fx\n", speedup);
+    printf("VLLM_VS_NAIVE: %.2fx\n", unfused_s / vllm_s);
+    std::cout << "GEMMS: Q({{ 'K4' if use_rope else 'K1' }}) V(K1) O(K0) FFN({{ ffn_activation }})" << std::endl;
+    std::cout << "NOTE: K projection omitted (same kernel as Q)" << std::endl;
+  }
+
+  return all_passed ? 0 : 1;
+}

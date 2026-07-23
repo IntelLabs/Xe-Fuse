@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xe-fuse"
+version = "0.1.0"
+description = "xe-fuse Python tooling: autotune codegen, fulsim analysis, tile selection"
+requires-python = ">=3.10"
+dependencies = [
+    "jinja2",
+    "pandas",
+    "numpy",
+    "openpyxl",
+]

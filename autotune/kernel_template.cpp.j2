@@ -1,0 +1,125 @@
+// Auto-generated xe-fuse kernel benchmark
+// Kernel: {{ kernel_name }}
+// Generated: {{ timestamp }}
+//
+// EVT tree: {{ evt_description }}
+
+#include "xe-fuse/builder/epilogue_builder.hpp"
+
+#include "cutlass/util/GPU_Clock.hpp"
+#include "cutlass/util/command_line.h"
+#include "cutlass/util/device_memory.h"
+#include "cutlass/util/packed_stride.hpp"
+#include "cutlass/util/reference/device/gemm_complex.h"
+#include "cutlass/util/reference/device/tensor_compare.h"
+
+#include "sycl_common.hpp"
+#include "helper.h"
+
+#include <random>
+#include <cmath>
+#include <iostream>
+
+using namespace cute;
+namespace b = xe_fuse::builder;
+using bf16 = cutlass::bfloat16_t;
+
+using TileShape = Shape<{{ tile_shape }}>;
+
+// ---- EVT tree definition ----
+{{ evt_typedefs }}
+
+// ---- Kernel assembly ----
+using KernelConfig = b::MakeGemm<EVT, {{ element_a }}, {{ element_b }}, {{ element_d }}, {{ element_acc }}, {{ element_compute }}, TileShape{{ make_gemm_extra }}>;
+using GemmOp = typename KernelConfig::Gemm;
+
+struct Options {
+  int m = {{ default_m }}, n = {{ default_n }}, k = {{ default_k }}, l = 1;
+  int iterations = {{ default_iterations }};
+  int verify = {{ default_verify }};
+
+  void parse(int argc, char const** args) {
+    cutlass::CommandLine cmd(argc, args);
+    cmd.get_cmd_line_argument("m", m, {{ default_m }});
+    cmd.get_cmd_line_argument("n", n, {{ default_n }});
+    cmd.get_cmd_line_argument("k", k, {{ default_k }});
+    cmd.get_cmd_line_argument("l", l, 1);
+    cmd.get_cmd_line_argument("iterations", iterations, {{ default_iterations }});
+    cmd.get_cmd_line_argument("verify", verify, {{ default_verify }});
+  }
+};
+
+int main(int argc, const char** argv) {
+  Options opts;
+  opts.parse(argc, argv);
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+  int M = opts.m, N = opts.n, K = opts.k, L = opts.l;
+
+  using StrideA = typename GemmOp::GemmKernel::StrideA;
+  using StrideB = typename GemmOp::GemmKernel::StrideB;
+
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, make_shape(M, K, L));
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, make_shape(N, K, L));
+  auto stride_C = cutlass::make_cute_packed_stride(KernelConfig::StrideC{}, make_shape(M, N, L));
+  auto stride_D = cutlass::make_cute_packed_stride(KernelConfig::StrideD{}, make_shape(M, N, L));
+
+  // Allocate matrices
+  cutlass::DeviceAllocation<{{ element_a }}> block_A(static_cast<size_t>(M) * K * L);
+  cutlass::DeviceAllocation<{{ element_b }}> block_B(static_cast<size_t>(K) * N * L);
+  cutlass::DeviceAllocation<{{ element_d }}> block_D(static_cast<size_t>(M) * N * L);
+
+  initialize_block(block_A, 2023);
+  initialize_block(block_B, 2022);
+
+  // Allocate auxiliary data
+{{ aux_allocations }}
+
+  // Build EVT arguments
+{{ evt_args_construction }}
+
+  typename GemmOp::GemmKernel::EpilogueArguments epilogue_args{
+    evt_args, nullptr, stride_C, block_D.get(), stride_D
+  };
+  typename GemmOp::GemmKernel::Arguments arguments{
+    cutlass::gemm::GemmUniversalMode::kGemm,
+    {M, N, K, L},
+    {block_A.get(), stride_A, block_B.get(), stride_B},
+    epilogue_args, hw_info
+  };
+
+  GemmOp gemm_op;
+  size_t ws_size = GemmOp::get_workspace_size(arguments);
+  cutlass::device_memory::allocation<uint8_t> workspace(ws_size);
+
+  CUTLASS_CHECK(gemm_op.can_implement(arguments));
+  CUTLASS_CHECK(gemm_op.initialize(arguments, workspace.get()));
+  CUTLASS_CHECK(gemm_op.run());
+  compat::wait();
+
+{% if has_verify %}
+  if (opts.verify) {
+{{ verify_code }}
+  } else {
+    std::cout << "Disposition: skipped" << std::endl;
+  }
+{% else %}
+  std::cout << "Disposition: skipped (no reference)" << std::endl;
+{% endif %}
+
+  if (opts.iterations > 0) {
+    GPU_Clock timer;
+    timer.start();
+    for (int i = 0; i < opts.iterations; ++i) gemm_op.run();
+    compat::wait();
+
+    float time_s = timer.seconds() / opts.iterations;
+    double tflops = (2.0 * M * N * K * L) * 1e-12;
+    std::cout << "Problem Size: " << M << 'x' << N << 'x' << K << 'x' << L << std::endl;
+    printf("{{ kernel_name }}: [%4.3f]TFlop/s  (%6.4f)ms\n", tflops / time_s, time_s * 1000);
+  }
+
+  return 0;
+}
