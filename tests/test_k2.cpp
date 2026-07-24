@@ -48,7 +48,10 @@ int main(int argc, const char** argv) {
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
   int M = opts.m, N = opts.n, K = opts.k, L = opts.l;
-
+  if ((N & 1) != 0) {
+    printf("Error: N must be even for SwiGLU (interleaved gate/up). Got N=%d\n", N);
+    return 1;
+  }
   using StrideA = typename GemmOp::GemmKernel::StrideA;
   using StrideB = typename GemmOp::GemmKernel::StrideB;
 
