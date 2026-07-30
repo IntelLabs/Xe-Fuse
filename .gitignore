@@ -1,0 +1,16 @@
+build/
+install/
+__pycache__/
+*.pyc
+.venv/
+fulsim_logs_*/
+autotune/*.out
+tests/*.out
+*.out
+# generated sweep data / plots / reference papers
+autotune/*.csv
+autotune/*.xlsx
+tests/*.csv
+tests/*.pdf
+tests/*.png
+*.pdf
