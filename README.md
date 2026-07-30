@@ -1,5 +1,11 @@
 # xe-fuse
 
+<img src="assets/xe-fuse-logo.png" alt="xe-fuse banner" width="100%"/>
+
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/IntelLabs/Xe-Fuse/badge)](https://scorecard.dev/viewer/?uri=github.com/IntelLabs/Xe-Fuse)
+
+> ⚠️ **Disclaimer**: This project is currently in active development. The code is **not stable** and **not intended for use in production environments**. Interfaces, features, and behaviors are subject to change without notice.
+
 GEMM epilogue fusion framework for Intel Xe GPUs, built on sycl-tla.
 
 Fuses memory-bound Transformer operations (RMSNorm, SwiGLU, RoPE, GeLU, residual-add, etc.) into GEMM epilogues — the ops execute on data still in registers from the accumulator, avoiding separate kernel launches and global memory round-trips.

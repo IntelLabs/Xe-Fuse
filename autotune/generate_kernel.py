@@ -44,8 +44,6 @@ Kernel spec format (JSON):
 
 import argparse
 import json
-import os
-import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -68,8 +66,8 @@ PRESETS = {
             "",
             "typename b::MulOp<>::Arguments mul_args{};",
             "",
-            "typename EVT::Arguments evt_args{accum_args, scale_args, mul_args};"
-        ]
+            "typename EVT::Arguments evt_args{accum_args, scale_args, mul_args};",
+        ],
     },
     "k3": {
         "name": "K3_RoPE",
@@ -77,7 +75,12 @@ PRESETS = {
         "tile_shape": "_256, _256, _32",
         "evt_typedefs": "using EVT = b::RoPE<float>;",
         "aux_data": [
-            {"name": "cos_sin", "type": "float", "shape": "M * N * L", "init_seed": 2024}
+            {
+                "name": "cos_sin",
+                "type": "float",
+                "shape": "M * N * L",
+                "init_seed": 2024,
+            }
         ],
         "evt_args": [
             "typename b::AuxLoad<float>::Arguments cs_args;",
@@ -88,8 +91,8 @@ PRESETS = {
             "",
             "typename xe_fuse::XeRoPECompute::Arguments rope_args{};",
             "",
-            "typename EVT::Arguments evt_args{cs_args, rope_args};"
-        ]
+            "typename EVT::Arguments evt_args{cs_args, rope_args};",
+        ],
     },
     "k4": {
         "name": "K4_RmsNormRoPE",
@@ -98,7 +101,12 @@ PRESETS = {
         "evt_typedefs": "using EVT = b::RoPEComposed<b::ScaleRows<b::Acc, TileShape, float>, float>;",
         "aux_data": [
             {"name": "scale", "type": "float", "shape": "M * L", "init_seed": 42},
-            {"name": "cos_sin", "type": "float", "shape": "M * N * L", "init_seed": 2024}
+            {
+                "name": "cos_sin",
+                "type": "float",
+                "shape": "M * N * L",
+                "init_seed": 2024,
+            },
         ],
         "evt_args": [
             "// child 0: ScaleRows (inner tree)",
@@ -118,8 +126,8 @@ PRESETS = {
             "    cute::Stride<int64_t, cute::Int<1>, int64_t>{}, make_shape(M, N, L));",
             "",
             "typename xe_fuse::XeRoPEComputeTwoChild::Arguments rope_args{};",
-            "typename EVT::Arguments evt_args{rms_args, cs_args, rope_args};"
-        ]
+            "typename EVT::Arguments evt_args{rms_args, cs_args, rope_args};",
+        ],
     },
     "k4v2": {
         "name": "K4v2_RoPEScaled",
@@ -128,7 +136,12 @@ PRESETS = {
         "evt_typedefs": "using EVT = b::RoPEScaled<TileShape, float, float>;",
         "aux_data": [
             {"name": "scale", "type": "float", "shape": "M * L", "init_seed": 42},
-            {"name": "cos_sin", "type": "float", "shape": "M * N * L", "init_seed": 2024}
+            {
+                "name": "cos_sin",
+                "type": "float",
+                "shape": "M * N * L",
+                "init_seed": 2024,
+            },
         ],
         "evt_args": [
             "// child 0: ColBroadcast<R>",
@@ -147,8 +160,8 @@ PRESETS = {
             "// root: XeRoPEScaledCompute (merged)",
             "typename xe_fuse::XeRoPEScaledCompute::Arguments rope_args{};",
             "",
-            "typename EVT::Arguments evt_args{scale_args, cs_args, rope_args};"
-        ]
+            "typename EVT::Arguments evt_args{scale_args, cs_args, rope_args};",
+        ],
     },
     "k0a": {
         "name": "K0a_ResidualGamma",
@@ -156,8 +169,13 @@ PRESETS = {
         "tile_shape": "_256, _256, _32",
         "evt_typedefs": "using EVT = b::ScaleCols<b::AddResidual<bf16>, TileShape, float>;",
         "aux_data": [
-            {"name": "residual", "type": "bf16", "shape": "M * N * L", "init_seed": 2021},
-            {"name": "gamma", "type": "float", "shape": "N * L", "init_seed": 99}
+            {
+                "name": "residual",
+                "type": "bf16",
+                "shape": "M * N * L",
+                "init_seed": 2021,
+            },
+            {"name": "gamma", "type": "float", "shape": "N * L", "init_seed": 99},
         ],
         "evt_args": [
             "// RowBroadcast<gamma> (child 0 of outer Mul)",
@@ -178,8 +196,8 @@ PRESETS = {
             "",
             "// Outer Mul",
             "typename b::MulOp<>::Arguments mul_args{};",
-            "typename EVT::Arguments evt_args{gamma_args, inner_args, mul_args};"
-        ]
+            "typename EVT::Arguments evt_args{gamma_args, inner_args, mul_args};",
+        ],
     },
     "k2": {
         "name": "K2_RmsNormSwiGLU",
@@ -201,8 +219,8 @@ PRESETS = {
             "",
             "// Outer: SwiGLU",
             "typename xe_fuse::XePairwiseCompute<xe_fuse::SwiGLUFn>::Arguments swiglu_args{};",
-            "typename EVT::Arguments evt_args{rms_args, swiglu_args};"
-        ]
+            "typename EVT::Arguments evt_args{rms_args, swiglu_args};",
+        ],
     },
     "k2_geglu": {
         "name": "K2_RmsNormGeGLU",
@@ -224,8 +242,8 @@ PRESETS = {
             "",
             "// Outer: GeGLU",
             "typename xe_fuse::XePairwiseCompute<xe_fuse::GeGLUFn>::Arguments geglu_args{};",
-            "typename EVT::Arguments evt_args{rms_args, geglu_args};"
-        ]
+            "typename EVT::Arguments evt_args{rms_args, geglu_args};",
+        ],
     },
     "k1v2": {
         "name": "K1v2_ScaleRowsMerged",
@@ -245,8 +263,8 @@ PRESETS = {
             "// root: XeScaleRowsCompute (merged)",
             "typename xe_fuse::XeScaleRowsCompute::Arguments visitor_args{};",
             "",
-            "typename EVT::Arguments evt_args{scale_args, visitor_args};"
-        ]
+            "typename EVT::Arguments evt_args{scale_args, visitor_args};",
+        ],
     },
     "k2v2": {
         "name": "K2v2_SwiGLUScaled",
@@ -266,8 +284,8 @@ PRESETS = {
             "// root: XeScaleRowsSwiGLUCompute (merged)",
             "typename xe_fuse::XeScaleRowsSwiGLUCompute::Arguments visitor_args{};",
             "",
-            "typename EVT::Arguments evt_args{scale_args, visitor_args};"
-        ]
+            "typename EVT::Arguments evt_args{scale_args, visitor_args};",
+        ],
     },
     "k2v2_geglu": {
         "name": "K2v2_GeGLUScaled",
@@ -287,8 +305,8 @@ PRESETS = {
             "// root: XeScaleRowsGeGLUCompute (merged)",
             "typename xe_fuse::XeScaleRowsGeGLUCompute::Arguments visitor_args{};",
             "",
-            "typename EVT::Arguments evt_args{scale_args, visitor_args};"
-        ]
+            "typename EVT::Arguments evt_args{scale_args, visitor_args};",
+        ],
     },
     "w8a8_dequant": {
         "name": "W8A8_Dequant",
@@ -304,7 +322,12 @@ PRESETS = {
         "evt_typedefs": "using EVT = b::DequantW8A8<TileShape, float, float>;",
         "aux_data": [
             {"name": "scale_token", "type": "float", "shape": "M * L", "init_seed": 42},
-            {"name": "scale_channel", "type": "float", "shape": "N * L", "init_seed": 99}
+            {
+                "name": "scale_channel",
+                "type": "float",
+                "shape": "N * L",
+                "init_seed": 99,
+            },
         ],
         "evt_args": [
             "// Inner Mul: Acc * scale_token[m] (ColBroadcast, Idx=0)",
@@ -325,8 +348,8 @@ PRESETS = {
             "// Compose: EVT = Mul(Mul(Acc, ColBcast), RowBcast)",
             "using InnerMul = b::Mul<b::Acc, b::ColBroadcast<0, TileShape, float>>;",
             "typename InnerMul::Arguments inner_args{accum_args, token_args, inner_mul_args};",
-            "typename EVT::Arguments evt_args{inner_args, channel_args, outer_mul_args};"
-        ]
+            "typename EVT::Arguments evt_args{inner_args, channel_args, outer_mul_args};",
+        ],
     },
     "w8a8_dequant_biased": {
         "name": "W8A8_DequantBiased",
@@ -342,8 +365,13 @@ PRESETS = {
         "evt_typedefs": "using EVT = b::DequantW8A8Biased<TileShape, float, float, float>;",
         "aux_data": [
             {"name": "scale_token", "type": "float", "shape": "M * L", "init_seed": 42},
-            {"name": "scale_channel", "type": "float", "shape": "N * L", "init_seed": 99},
-            {"name": "bias", "type": "float", "shape": "N * L", "init_seed": 77}
+            {
+                "name": "scale_channel",
+                "type": "float",
+                "shape": "N * L",
+                "init_seed": 99,
+            },
+            {"name": "bias", "type": "float", "shape": "N * L", "init_seed": 77},
         ],
         "evt_args": [
             "// Inner Mul: Acc * scale_token[m] (ColBroadcast, Idx=0)",
@@ -373,9 +401,9 @@ PRESETS = {
             "using DequantMul = b::DequantW8A8<TileShape, float, float>;",
             "typename InnerMul::Arguments inner_args{accum_args, token_args, inner_mul_args};",
             "typename DequantMul::Arguments dequant_args{inner_args, channel_args, mid_mul_args};",
-            "typename EVT::Arguments evt_args{dequant_args, bias_args, add_args};"
-        ]
-    }
+            "typename EVT::Arguments evt_args{dequant_args, bias_args, add_args};",
+        ],
+    },
 }
 
 
@@ -387,7 +415,9 @@ def generate_aux_allocations(aux_data: list[dict]) -> str:
         name = aux["name"]
         shape = aux["shape"]
         seed = aux.get("init_seed", 2020)
-        lines.append(f"  cutlass::DeviceAllocation<{ctype}> block_{name}(static_cast<size_t>({shape}));")
+        lines.append(
+            f"  cutlass::DeviceAllocation<{ctype}> block_{name}(static_cast<size_t>({shape}));"
+        )
         lines.append(f"  initialize_block(block_{name}, {seed});")
     return "\n".join(lines)
 
@@ -399,6 +429,7 @@ def generate_cpp(spec: dict, defaults: dict | None = None) -> str:
     if template_path.exists():
         try:
             from jinja2 import Template
+
             with open(template_path) as f:
                 tmpl = Template(f.read())
 
@@ -411,8 +442,10 @@ def generate_cpp(spec: dict, defaults: dict | None = None) -> str:
             align_cd = spec.get("alignment_cd", 8)
             make_gemm_extra = ""
             if align_ab != 8 or align_cd != 8:
-                make_gemm_extra = (f",\n    cutlass::layout::RowMajor, cutlass::layout::RowMajor, "
-                                   f"{align_ab}, {align_cd}")
+                make_gemm_extra = (
+                    f",\n    cutlass::layout::RowMajor, cutlass::layout::RowMajor, "
+                    f"{align_ab}, {align_cd}"
+                )
 
             return tmpl.render(
                 kernel_name=spec["name"],
@@ -465,8 +498,10 @@ def generate_cpp_inline(spec: dict, defaults: dict | None = None) -> str:
     # MakeGemm template args beyond the 7 positional defaults
     make_gemm_extra = ""
     if align_ab != 8 or align_cd != 8:
-        make_gemm_extra = (f",\n    cutlass::layout::RowMajor, cutlass::layout::RowMajor, "
-                           f"{align_ab}, {align_cd}")
+        make_gemm_extra = (
+            f",\n    cutlass::layout::RowMajor, cutlass::layout::RowMajor, "
+            f"{align_ab}, {align_cd}"
+        )
 
     return f"""\
 // Auto-generated xe-fuse kernel benchmark
@@ -675,29 +710,32 @@ STANDALONE_PRESETS = {
         ],
         "op_code": [
             "xe_fuse::standalone::scale_rows(q, block_D.get(), block_scale.get(), M, N, L);"
-        ]
+        ],
     },
     "sa_residual_gamma": {
         "name": "SA_ResidualGamma",
         "evt_description": "D[m,n] = gamma[n] * (D + residual) (standalone)",
         "standalone": True,
         "aux_data": [
-            {"name": "residual", "type": "bf16", "shape": "M * N * L", "init_seed": 2021},
-            {"name": "gamma", "type": "float", "shape": "N * L", "init_seed": 99}
+            {
+                "name": "residual",
+                "type": "bf16",
+                "shape": "M * N * L",
+                "init_seed": 2021,
+            },
+            {"name": "gamma", "type": "float", "shape": "N * L", "init_seed": 99},
         ],
         "op_code": [
             "xe_fuse::standalone::residual_gamma(q, block_D.get(), block_residual.get(),",
-            "    block_gamma.get(), M, N, L);"
-        ]
+            "    block_gamma.get(), M, N, L);",
+        ],
     },
     "sa_swiglu": {
         "name": "SA_SwiGLU",
         "evt_description": "D = SwiGLU(D) pairwise (standalone)",
         "standalone": True,
         "aux_data": [],
-        "op_code": [
-            "xe_fuse::standalone::swiglu(q, block_D.get(), M, N, L);"
-        ]
+        "op_code": ["xe_fuse::standalone::swiglu(q, block_D.get(), M, N, L);"],
     },
     "sa_rope_scaled": {
         "name": "SA_RoPEScaled",
@@ -705,16 +743,21 @@ STANDALONE_PRESETS = {
         "standalone": True,
         "aux_data": [
             {"name": "scale", "type": "float", "shape": "M * L", "init_seed": 42},
-            {"name": "cos_sin", "type": "float", "shape": "M * N * L", "init_seed": 2024},
-            {"name": "tmp", "type": "bf16", "shape": "M * N * L", "init_seed": 0}
+            {
+                "name": "cos_sin",
+                "type": "float",
+                "shape": "M * N * L",
+                "init_seed": 2024,
+            },
+            {"name": "tmp", "type": "bf16", "shape": "M * N * L", "init_seed": 0},
         ],
         "op_code": [
             "q.memcpy(block_tmp.get(), block_D.get(), static_cast<size_t>(M) * N * L * sizeof(bf16));",
             "q.wait();",
             "xe_fuse::standalone::rope_scaled(q, block_D.get(), block_tmp.get(),",
-            "    block_scale.get(), block_cos_sin.get(), M, N, L);"
-        ]
-    }
+            "    block_scale.get(), block_cos_sin.get(), M, N, L);",
+        ],
+    },
 }
 
 
@@ -723,17 +766,25 @@ def main():
     all_presets = {**PRESETS, **STANDALONE_PRESETS}
 
     parser.add_argument("--spec", help="Path to kernel spec JSON file")
-    parser.add_argument("--preset", choices=list(all_presets.keys()),
-                        help="Use a built-in kernel preset")
+    parser.add_argument(
+        "--preset",
+        choices=list(all_presets.keys()),
+        help="Use a built-in kernel preset",
+    )
     parser.add_argument("--output", "-o", help="Output .cpp path")
     parser.add_argument("--m", type=int, default=4096)
     parser.add_argument("--n", type=int, default=4096)
     parser.add_argument("--k", type=int, default=4096)
     parser.add_argument("--iterations", type=int, default=200)
-    parser.add_argument("--tile", type=str, default=None,
-                        help="Override tile shape, e.g. '128x256x32' or 'auto'")
-    parser.add_argument("--list-presets", action="store_true",
-                        help="List available presets and exit")
+    parser.add_argument(
+        "--tile",
+        type=str,
+        default=None,
+        help="Override tile shape, e.g. '128x256x32' or 'auto'",
+    )
+    parser.add_argument(
+        "--list-presets", action="store_true", help="List available presets and exit"
+    )
     args = parser.parse_args()
 
     if args.list_presets:
@@ -762,6 +813,7 @@ def main():
     if args.tile:
         if args.tile == "auto":
             from tile_selector import select_tile
+
             kernel_tag = args.preset.split("_")[0] if args.preset else "bare"
             spec["tile_shape"] = select_tile(args.m, args.n, args.k, kernel_tag)
         else:
