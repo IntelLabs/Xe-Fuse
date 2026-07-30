@@ -10,13 +10,13 @@ Fuses memory-bound Transformer operations (RMSNorm, SwiGLU, RoPE, GeLU, residual
 
 ```bash
 # Generate a fused GEMM + RMSNorm + SwiGLU kernel
-uv run autotune/generate_kernel.py --preset k2 -o /tmp/kernel.cpp
+python3 autotune/generate_kernel.py --preset k2 -o /tmp/kernel.cpp
 
 # Compile
 icpx -fsycl -DCUTLASS_ENABLE_SYCL -DSYCL_INTEL_TARGET \
-    -I $SYCL_TLA/include -I $SYCL_TLA/tools/util/include \
-    -I $SYCL_TLA/examples/common -I $SYCL_TLA/applications \
-    -I applications/xe-fuse/include \
+    -I $SYCL_TLA_DIR/include -I $SYCL_TLA_DIR/tools/util/include \
+    -I $SYCL_TLA_DIR/examples/common \
+    -I $XE_FUSE_DIR/include \
     -O2 -std=c++17 -fsycl-targets=spir64_gen \
     -o /tmp/kernel /tmp/kernel.cpp
 
@@ -27,7 +27,7 @@ icpx -fsycl -DCUTLASS_ENABLE_SYCL -DSYCL_INTEL_TARGET \
 ### Available kernel presets
 
 ```
-uv run autotune/generate_kernel.py --list-presets
+python3 autotune/generate_kernel.py --list-presets
 
 GEMM epilogue presets:
   k1               D = acc * R[m]                         (RMSNorm)
@@ -56,7 +56,7 @@ Standalone presets (unfused baselines):
 ### Available model presets
 
 ```
-uv run autotune/generate_pipeline.py --list-presets
+python3 autotune/generate_pipeline.py --list-presets
 
 Available model presets:
   Name             Model                    H   H_kv      I      FFN  RoPE
@@ -218,8 +218,8 @@ For unfused baselines or non-GEMM use:
 auto q = compat::get_default_queue();
 xe_fuse::standalone::scale_rows(q, data, scale, M, N, L);
 xe_fuse::standalone::gelu(q, data, M, N, L);
-xe_fuse::standalone::swiglu(q, data, out, M, N, L);
-xe_fuse::standalone::geglu(q, data, out, M, N, L);
+xe_fuse::standalone::swiglu(q, data, M, N, L);
+xe_fuse::standalone::geglu(q, data, M, N, L);
 xe_fuse::standalone::rope_scaled(q, data, tmp, scale, cos_sin, M, N, L);
 ```
 
@@ -282,11 +282,11 @@ across 7 tiles × 5 kernels × 32 GEMM shapes from 10+ model architectures).
 
 ```bash
 # Generate pipeline with autotuned tiles for target sequence length
-uv run autotune/generate_pipeline.py --preset llama3_8b --autotune --seq-len 128 -o pipeline.cpp
+python3 autotune/generate_pipeline.py --preset llama3_8b --autotune --seq-len 128 -o pipeline.cpp
 
 # Or override tile for a single kernel
-uv run autotune/generate_kernel.py --preset k2 --tile 64x128x32 -o kernel.cpp
-uv run autotune/generate_kernel.py --preset k1 --tile auto --m 128 --n 4096 --k 4096 -o kernel.cpp
+python3 autotune/generate_kernel.py --preset k2 --tile 64x128x32 -o kernel.cpp
+python3 autotune/generate_kernel.py --preset k1 --tile auto --m 128 --n 4096 --k 4096 -o kernel.cpp
 ```
 
 The tile selector (`autotune/tile_selector.py`) uses empirically-derived heuristics:

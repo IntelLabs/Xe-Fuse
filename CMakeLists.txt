@@ -57,7 +57,7 @@ else()
   message(STATUS "xe-fuse: fetching sycl-tla (tag=${SYCL_TLA_GIT_TAG}) via FetchContent")
   include(FetchContent)
   FetchContent_Declare(sycl_tla
-    GIT_REPOSITORY https://github.com/sandlbn/sycl-tla.git
+    GIT_REPOSITORY https://github.com/intel/sycl-tla.git
     GIT_TAG        ${SYCL_TLA_GIT_TAG}
     GIT_SHALLOW    ON)
   FetchContent_MakeAvailable(sycl_tla)
