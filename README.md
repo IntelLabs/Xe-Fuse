@@ -35,6 +35,7 @@ GEMM epilogue presets:
   k2               D = SwiGLU(acc * R[m])                  (RMSNorm + SwiGLU)
   k2_geglu         D = GeGLU(acc * R[m])                   (RMSNorm + GeGLU)
   k3               D = RoPE(acc, cos_sin)                  (positional encoding)
+  k4               D = RoPE(acc * R[m], cos_sin)           (RMSNorm + RoPE, composed tree)
   k4v2             D = RoPE(acc * R[m], cos_sin)           (RMSNorm + RoPE, merged)
 
 Merged visitors (flat tree):
