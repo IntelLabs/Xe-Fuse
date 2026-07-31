@@ -17,32 +17,58 @@ Usage:
     sbatch run_bench_e2e.sh
 """
 
-import time
-import torch
 import argparse
+import time
+
+import torch
 
 
 def load_vllm_ops():
     import vllm_xpu_kernels._C  # noqa: F401
+
     return torch.ops._C
 
 
 MODEL_PRESETS = {
     "llama3_8b": {
-        "name": "LLaMA 3 8B", "H": 4096, "H_kv": 1024, "I": 14336,
-        "head_dim": 128, "num_heads": 32, "num_kv_heads": 8, "act": "swiglu",
+        "name": "LLaMA 3 8B",
+        "H": 4096,
+        "H_kv": 1024,
+        "I": 14336,
+        "head_dim": 128,
+        "num_heads": 32,
+        "num_kv_heads": 8,
+        "act": "swiglu",
     },
     "gemma2_9b": {
-        "name": "Gemma 2 9B", "H": 3584, "H_kv": 2048, "I": 14336,
-        "head_dim": 256, "num_heads": 16, "num_kv_heads": 8, "act": "geglu",
+        "name": "Gemma 2 9B",
+        "H": 3584,
+        "H_kv": 2048,
+        "I": 14336,
+        "head_dim": 256,
+        "num_heads": 16,
+        "num_kv_heads": 8,
+        "act": "geglu",
     },
     "qwen25_7b": {
-        "name": "Qwen 2.5 7B", "H": 3584, "H_kv": 512, "I": 18944,
-        "head_dim": 128, "num_heads": 28, "num_kv_heads": 4, "act": "swiglu",
+        "name": "Qwen 2.5 7B",
+        "H": 3584,
+        "H_kv": 512,
+        "I": 18944,
+        "head_dim": 128,
+        "num_heads": 28,
+        "num_kv_heads": 4,
+        "act": "swiglu",
     },
     "phi3_mini": {
-        "name": "Phi-3 Mini 3.8B", "H": 3072, "H_kv": 3072, "I": 8192,
-        "head_dim": 128, "num_heads": 24, "num_kv_heads": 24, "act": "swiglu",
+        "name": "Phi-3 Mini 3.8B",
+        "H": 3072,
+        "H_kv": 3072,
+        "I": 8192,
+        "head_dim": 128,
+        "num_heads": 24,
+        "num_kv_heads": 24,
+        "act": "swiglu",
     },
 }
 
@@ -164,12 +190,14 @@ def bench_onednn_gemm_only(cfg, M, warmup=20, iters=200):
 
 def pipeline_flops(M, H, H_kv, N_ffn):
     """Total FLOPs for 4 GEMMs in the pipeline."""
-    return 2.0 * M * (H*H + H_kv*H + H*H + N_ffn*H)
+    return 2.0 * M * (H * H + H_kv * H + H * H + N_ffn * H)
 
 
 def main():
     parser = argparse.ArgumentParser(description="xe-fuse vs real vllm: E2E comparison")
-    parser.add_argument("--preset", default="llama3_8b", choices=list(MODEL_PRESETS.keys()))
+    parser.add_argument(
+        "--preset", default="llama3_8b", choices=list(MODEL_PRESETS.keys())
+    )
     parser.add_argument("--m", type=int, default=2048)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--all", action="store_true", help="Run all presets")
@@ -191,10 +219,12 @@ def main():
         N_flops = pipeline_flops(args.m, H, H_kv, 2 * I)
         M = args.m
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  {cfg['name']} (H={H}, H_kv={H_kv}, I={I})")
-        print(f"  Pipeline: Q(RMSNorm+RoPE) + V(RMSNorm) + O(ResAdd+RMSNorm) + FFN({cfg['act']})")
-        print(f"{'='*60}")
+        print(
+            f"  Pipeline: Q(RMSNorm+RoPE) + V(RMSNorm) + O(ResAdd+RMSNorm) + FFN({cfg['act']})"
+        )
+        print(f"{'=' * 60}")
 
         # Benchmark oneDNN GEMMs only (no ops)
         t_gemm_only = bench_onednn_gemm_only(cfg, M, iters=args.iters)
@@ -208,16 +238,16 @@ def main():
         t_ops_overhead = t_vllm_e2e - t_gemm_only
         ops_pct = t_ops_overhead / t_vllm_e2e * 100
 
-        print(f"\n  oneDNN GEMMs only (4x torch.mm):")
+        print("\n  oneDNN GEMMs only (4x torch.mm):")
         print(f"    Time: {t_gemm_only:.4f} ms")
         print(f"    Throughput: {gemm_tflops:.1f} TFlop/s")
-        print(f"\n  vllm full pipeline (oneDNN GEMM + real vllm ops):")
+        print("\n  vllm full pipeline (oneDNN GEMM + real vllm ops):")
         print(f"    Time: {t_vllm_e2e:.4f} ms")
         print(f"    Throughput: {vllm_tflops:.1f} TFlop/s")
         print(f"    Ops overhead: {t_ops_overhead:.4f} ms ({ops_pct:.1f}% of pipeline)")
 
         # Structured output for parsing
-        print(f"\n=== STRUCTURED OUTPUT ===")
+        print("\n=== STRUCTURED OUTPUT ===")
         print(f"E2E: {preset_name}")
         print(f"MODEL: {cfg['name']}")
         print(f"DIMS: M={M} H={H} H_kv={H_kv} I={I}")
