@@ -113,7 +113,7 @@ def select_tile(M: int, N: int, K: int, kernel: str = "bare", groups: int = 1) -
     elif M <= 128:
         if N <= 384 and K > 1024:
             tile_m, tile_n = 128, 128
-        elif N <= 384 or N <= 1024:
+        elif N <= 1024:
             tile_m, tile_n = 128, 64
         elif N <= 4096:
             tile_m, tile_n = 64, 64
@@ -157,7 +157,7 @@ def select_tile(M: int, N: int, K: int, kernel: str = "bare", groups: int = 1) -
     elif M <= 640:
         if N <= 384 and K > 1024:
             tile_m, tile_n = 128, 128
-        elif N <= 384 or N <= 1024:
+        elif N <= 1024:
             tile_m, tile_n = 384, 64
         elif N <= 4096 and K <= 384:
             tile_m, tile_n = 128, 128
