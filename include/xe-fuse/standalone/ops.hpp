@@ -283,4 +283,74 @@ inline void select_logits(sycl::queue& q, bf16 const* logits, int const* targets
   });
 }
 
+// ── INT8 quantization and dequantization ─────────────────────────────────────
+
+// Quantize BF16 normalized activations to INT8 using a precomputed rstd vector.
+// Used in the naive_int8 baseline where rstd already exists from a prior
+// compute_rstd call.
+//
+//   normed[m,n]    = input[m,n] * rstd[m]
+//   scale_tok[m]   = max_n(|normed[m,n]|) / 127     (written to scale_token_out)
+//   quant_out[m,n] = round(normed[m,n] / scale_tok[m]) clamped to [-128, 127]
+//
+// Note: this is a 2-pass kernel (max_abs then quantize). For a fused single-pass
+// version that also computes rstd, use launch_compute_rstd_and_quantize().
+inline void quantize_activations(sycl::queue& q,
+                                  bf16 const* input,
+                                  float const* rstd,
+                                  int8_t*      quant_out,
+                                  float*       scale_token_out,
+                                  int M, int N, int L) {
+  int m_val = M, n_val = N;
+  // Pass 1: compute scale_token[m] = max(|input[m,n]*rstd[m]|) / 127
+  q.parallel_for(sycl::range<1>(static_cast<size_t>(M) * L), [=](sycl::id<1> idx) {
+    int64_t row_idx = idx[0];
+    int batch = static_cast<int>(row_idx / m_val);
+    int m     = static_cast<int>(row_idx % m_val);
+    int64_t base = static_cast<int64_t>(batch) * m_val * n_val + static_cast<int64_t>(m) * n_val;
+    float r    = rstd[row_idx];
+    float mx   = 0.f;
+    for (int n = 0; n < n_val; ++n)
+      mx = sycl::fmax(mx, sycl::fabs(static_cast<float>(input[base + n]) * r));
+    scale_token_out[row_idx] = mx / 127.f + 1e-8f;
+  });
+  q.wait();
+
+  // Pass 2: quantize
+  int64_t total = static_cast<int64_t>(M) * N * L;
+  q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
+    int64_t i   = idx[0];
+    int row_idx = static_cast<int>(i / n_val);
+    float normed = static_cast<float>(input[i]) * rstd[row_idx];
+    float qval   = sycl::round(normed / scale_token_out[row_idx]);
+    qval = sycl::fmin(sycl::fmax(qval, -128.f), 127.f);
+    quant_out[i] = static_cast<int8_t>(qval);
+  });
+}
+
+// Dequantize INT32 GEMM accumulator to BF16 using per-token and per-channel scales.
+// Naive baseline: called after a bare INT8 GEMM that wrote INT32 output.
+//
+//   out[m,n] = bf16( int32_acc[m,n] * scale_token[m] * scale_channel[n] )
+inline void dequant_w8a8(sycl::queue& q,
+                          bf16*         out,
+                          int32_t const* acc,
+                          float const*  scale_token,
+                          float const*  scale_channel,
+                          int M, int N, int L) {
+  int64_t total = static_cast<int64_t>(M) * N * L;
+  int m_val = M, n_val = N;
+  q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
+    int64_t i   = idx[0];
+    int col     = static_cast<int>(i % n_val);
+    int row_idx = static_cast<int>(i / n_val);
+    int m       = row_idx % m_val;
+    int batch   = row_idx / m_val;
+    float val   = static_cast<float>(acc[i])
+                * scale_token[batch * m_val + m]
+                * scale_channel[batch * n_val + col];
+    out[i] = static_cast<bf16>(val);
+  });
+}
+
 }  // namespace xe_fuse::standalone

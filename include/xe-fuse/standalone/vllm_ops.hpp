@@ -1,6 +1,13 @@
 #pragma once
 
 // vllm-equivalent standalone kernels for xe-fuse comparison benchmarks.
+// Includes merged INT8 dequant + op kernels for the vllm_int8_equiv comparison.
+// These represent what a well-implemented INT8 inference engine would do:
+// one kernel that reads the INT32 GEMM accumulator and applies dequant + activation
+// without a separate DRAM round-trip for the dequant output.
+//
+// xe-fuse W8A8 goes one step further: the INT32 accumulator never reaches DRAM
+// (dequant + activation happen directly in the GEMM epilogue registers).
 //
 // These re-implement the algorithmic patterns from vllm-xpu-kernels
 // (csrc/layernorm.cpp, csrc/activation.cpp, csrc/pos_encoding_kernels.cpp)
@@ -12,6 +19,7 @@
 //   vllm:    bare GEMM → separate fused standalone kernel → bare GEMM → ...
 //   xe-fuse: GEMM + epilogue fusion (ops run on register data)
 
+#include <cstdint>
 #include <sycl/sycl.hpp>
 #include "cutlass/bfloat16.h"
 
@@ -217,6 +225,124 @@ inline void rotary_embedding(sycl::queue& q, bf16* query, bf16* key,
           }
         }
       });
+  });
+}
+
+// ── INT8 merged dequant + op kernels (vllm_int8_equiv comparison) ────────────
+//
+// These read INT32 GEMM accumulator output from DRAM, apply W8A8 dequantization
+// and the activation op in one pass, and write BF16 output.
+//
+// Compared to naive_int8 (separate dequant_w8a8 + separate op kernel):
+//   - One kernel launch instead of two
+//   - INT32 accumulator read once instead of write+read
+// Compared to xe-fuse W8A8:
+//   - INT32 accumulator still reaches DRAM (written by bare INT8 GEMM)
+//   - xe-fuse keeps it in registers throughout the GEMM epilogue
+
+// Merged: dequant INT32 → BF16, then apply SwiGLU
+// Input layout: [M, 2*d] INT32 (gate interleaved with up)
+// Output layout: [M, 2*d] BF16 (both lanes carry the same silu(gate)*up value)
+inline void dequant_and_silu_mul(sycl::queue& q,
+                                  bf16*         out,
+                                  int32_t const* acc,
+                                  float const*  scale_token,
+                                  float const*  scale_channel,
+                                  int d, int M) {
+  int N = 2 * d;
+  int wg_size = std::min(d, 1024);
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+      sycl::nd_range<1>(static_cast<size_t>(M) * wg_size, wg_size),
+      [=](sycl::nd_item<1> item) {
+        int row = item.get_group(0);
+        int lid = item.get_local_id(0);
+        int lsz = item.get_local_range(0);
+        int64_t in_base = static_cast<int64_t>(row) * N;
+        float st = scale_token[row];
+
+        for (int i = lid; i < d; i += lsz) {
+          float gate = static_cast<float>(acc[in_base + i])
+                     * st * scale_channel[i];
+          float up   = static_cast<float>(acc[in_base + d + i])
+                     * st * scale_channel[d + i];
+          float silu_gate = gate / (1.0f + sycl::exp(-gate));
+          bf16  result    = static_cast<bf16>(silu_gate * up);
+          out[in_base + i]     = result;
+          out[in_base + d + i] = result;
+        }
+      });
+  });
+}
+
+// Merged: dequant INT32 → BF16, then apply GeGLU
+inline void dequant_and_gelu_mul(sycl::queue& q,
+                                  bf16*         out,
+                                  int32_t const* acc,
+                                  float const*  scale_token,
+                                  float const*  scale_channel,
+                                  int d, int M) {
+  int N = 2 * d;
+  int wg_size = std::min(d, 1024);
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+      sycl::nd_range<1>(static_cast<size_t>(M) * wg_size, wg_size),
+      [=](sycl::nd_item<1> item) {
+        int row = item.get_group(0);
+        int lid = item.get_local_id(0);
+        int lsz = item.get_local_range(0);
+        int64_t in_base = static_cast<int64_t>(row) * N;
+        float st = scale_token[row];
+
+        for (int i = lid; i < d; i += lsz) {
+          float gate = static_cast<float>(acc[in_base + i])
+                     * st * scale_channel[i];
+          float up   = static_cast<float>(acc[in_base + d + i])
+                     * st * scale_channel[d + i];
+          float gelu_gate = gate * 0.5f * (1.0f + sycl::erf(gate * 0.7071067811865475f));
+          bf16  result    = static_cast<bf16>(gelu_gate * up);
+          out[in_base + i]     = result;
+          out[in_base + d + i] = result;
+        }
+      });
+  });
+}
+
+// Merged: dequant INT32 → BF16, then apply NeoX RoPE in-place.
+// Input: INT32 accumulator [M, N], scale_token[M], scale_channel[N]
+// cos_sin_cache: [M, N] interleaved cos/sin (same layout as xe_fuse::standalone::rope)
+// Output: BF16 [M, N] with RoPE applied
+inline void dequant_and_rotary_embedding(sycl::queue& q,
+                                          bf16*         out,
+                                          int32_t const* acc,
+                                          float const*  scale_token,
+                                          float const*  scale_channel,
+                                          float const*  cos_sin_cache,
+                                          int M, int N) {
+  int64_t total = static_cast<int64_t>(M) * N;
+  q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
+    int64_t i    = idx[0];
+    int col      = static_cast<int>(i % N);
+    int row      = static_cast<int>(i / N);
+    int64_t base = static_cast<int64_t>(row) * N;
+    float st     = scale_token[row];
+
+    int even_col = col & ~1;
+    int odd_col  = even_col + 1;
+    if (odd_col >= N) {
+      out[i] = static_cast<bf16>(static_cast<float>(acc[i]) * st * scale_channel[col]);
+      return;
+    }
+    float x_even = static_cast<float>(acc[base + even_col]) * st * scale_channel[even_col];
+    float x_odd  = static_cast<float>(acc[base + odd_col])  * st * scale_channel[odd_col];
+    float cos_val = cos_sin_cache[base + even_col];
+    float sin_val = cos_sin_cache[base + odd_col];
+    float result;
+    if ((col & 1) == 0)
+      result = x_even * cos_val + x_odd * sin_val;
+    else
+      result = -x_even * sin_val + x_odd * cos_val;
+    out[i] = static_cast<bf16>(result);
   });
 }
 
