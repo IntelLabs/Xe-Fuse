@@ -80,8 +80,8 @@ int main(int argc, const char** argv) {
     std::uniform_int_distribution<int> dist(-64, 63);
     for (auto& v : h_A) v = static_cast<int8_t>(dist(rng_a));
     for (auto& v : h_B) v = static_cast<int8_t>(dist(rng_b));
-    compat::get_default_queue().memcpy(block_A.get(), h_A.data(), h_A.size());
-    compat::get_default_queue().memcpy(block_B.get(), h_B.data(), h_B.size());
+    compat::get_default_queue().memcpy(block_A.get(), h_A.data(), h_A.size() * sizeof(int8_t));
+    compat::get_default_queue().memcpy(block_B.get(), h_B.data(), h_B.size() * sizeof(int8_t));
   }
 
   {
@@ -189,14 +189,8 @@ int main(int argc, const char** argv) {
                      * st[batch * M_ + row] * sc[batch * N_ + even_col];
           float up   = acc[base + row * N_ + odd_col]
                      * st[batch * M_ + row] * sc[batch * N_ + odd_col];
-          // silu(gate) * up
           float silu_gate = gate / (1.f + sycl::exp(-gate));
-          float out = silu_gate * up;
-          ref[base - batch * M_ * N_ + row * N_ + even_col] = static_cast<K2W8A8::ElementD>(out);
-          ref[base - batch * M_ * N_ + row * N_ + odd_col]  = static_cast<K2W8A8::ElementD>(out);
-          // Note: both lanes get the same value; indexed by the even col for atomicity.
-          // The parallel_for will write even and odd separately but with the same value.
-          (void)col;  // col is redundant here; both branches write same value
+          ref[i] = static_cast<K2W8A8::ElementD>(silu_gate * up);
         }
       );
       compat::wait();

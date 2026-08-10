@@ -77,7 +77,7 @@ struct XeHadamardCompute : cutlass::epilogue::fusion::Sm90VisitorImpl<> {
         for (int stage = 0; stage < kStages; ++stage) {
           uint32_t mask = 1u << stage;
           uint32_t val_bits = reinterpret_cast<const uint32_t&>(val);
-          uint32_t partner_bits = shfl_xor_sync(0xFFFFFFFF, val_bits, mask, 16);
+          uint32_t partner_bits = shfl_xor_sync(0xFFFFFFFF, val_bits, mask, GroupSize);
           float partner_val = reinterpret_cast<const float&>(partner_bits);
 
           bool is_b_lane = (lane_id >> stage) & 1u;

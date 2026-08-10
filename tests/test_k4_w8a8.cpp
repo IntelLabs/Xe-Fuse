@@ -83,8 +83,8 @@ int main(int argc, const char** argv) {
     std::uniform_int_distribution<int> dist(-64, 63);
     for (auto& v : h_A) v = static_cast<int8_t>(dist(rng_a));
     for (auto& v : h_B) v = static_cast<int8_t>(dist(rng_b));
-    compat::get_default_queue().memcpy(block_A.get(), h_A.data(), h_A.size());
-    compat::get_default_queue().memcpy(block_B.get(), h_B.data(), h_B.size());
+    compat::get_default_queue().memcpy(block_A.get(), h_A.data(), h_A.size() * sizeof(int8_t));
+    compat::get_default_queue().memcpy(block_B.get(), h_B.data(), h_B.size() * sizeof(int8_t));
   }
 
   // Per-token and per-channel quantization scales (simulate realistic LLM values)

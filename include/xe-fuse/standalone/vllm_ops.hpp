@@ -241,31 +241,33 @@ inline void rotary_embedding(sycl::queue& q, bf16* query, bf16* key,
 //   - xe-fuse keeps it in registers throughout the GEMM epilogue
 
 // Merged: dequant INT32 → BF16, then apply SwiGLU
-// Input layout: [M, 2*d] INT32 (gate interleaved with up)
-// Output layout: [M, 2*d] BF16 (both lanes carry the same silu(gate)*up value)
+// Input layout: [L, M, 2*d] INT32 (gate interleaved with up)
+// Output layout: [L, M, 2*d] BF16 (both lanes carry the same silu(gate)*up value)
 inline void dequant_and_silu_mul(sycl::queue& q,
                                   bf16*         out,
                                   int32_t const* acc,
                                   float const*  scale_token,
                                   float const*  scale_channel,
-                                  int d, int M) {
+                                  int d, int M, int L = 1) {
   int N = 2 * d;
   int wg_size = std::min(d, 1024);
   q.submit([&](sycl::handler& cgh) {
     cgh.parallel_for(
-      sycl::nd_range<1>(static_cast<size_t>(M) * wg_size, wg_size),
+      sycl::nd_range<1>(static_cast<size_t>(M) * L * wg_size, wg_size),
       [=](sycl::nd_item<1> item) {
-        int row = item.get_group(0);
+        int grp = item.get_group(0);
+        int l   = grp / M;
+        int row = grp % M;
         int lid = item.get_local_id(0);
         int lsz = item.get_local_range(0);
-        int64_t in_base = static_cast<int64_t>(row) * N;
-        float st = scale_token[row];
+        int64_t in_base = (static_cast<int64_t>(l) * M + row) * N;
+        float st = scale_token[l * M + row];
 
         for (int i = lid; i < d; i += lsz) {
           float gate = static_cast<float>(acc[in_base + i])
-                     * st * scale_channel[i];
+                     * st * scale_channel[l * N + i];
           float up   = static_cast<float>(acc[in_base + d + i])
-                     * st * scale_channel[d + i];
+                     * st * scale_channel[l * N + d + i];
           float silu_gate = gate / (1.0f + sycl::exp(-gate));
           bf16  result    = static_cast<bf16>(silu_gate * up);
           out[in_base + i]     = result;
@@ -281,24 +283,26 @@ inline void dequant_and_gelu_mul(sycl::queue& q,
                                   int32_t const* acc,
                                   float const*  scale_token,
                                   float const*  scale_channel,
-                                  int d, int M) {
+                                  int d, int M, int L = 1) {
   int N = 2 * d;
   int wg_size = std::min(d, 1024);
   q.submit([&](sycl::handler& cgh) {
     cgh.parallel_for(
-      sycl::nd_range<1>(static_cast<size_t>(M) * wg_size, wg_size),
+      sycl::nd_range<1>(static_cast<size_t>(M) * L * wg_size, wg_size),
       [=](sycl::nd_item<1> item) {
-        int row = item.get_group(0);
+        int grp = item.get_group(0);
+        int l   = grp / M;
+        int row = grp % M;
         int lid = item.get_local_id(0);
         int lsz = item.get_local_range(0);
-        int64_t in_base = static_cast<int64_t>(row) * N;
-        float st = scale_token[row];
+        int64_t in_base = (static_cast<int64_t>(l) * M + row) * N;
+        float st = scale_token[l * M + row];
 
         for (int i = lid; i < d; i += lsz) {
           float gate = static_cast<float>(acc[in_base + i])
-                     * st * scale_channel[i];
+                     * st * scale_channel[l * N + i];
           float up   = static_cast<float>(acc[in_base + d + i])
-                     * st * scale_channel[d + i];
+                     * st * scale_channel[l * N + d + i];
           float gelu_gate = gate * 0.5f * (1.0f + sycl::erf(gate * 0.7071067811865475f));
           bf16  result    = static_cast<bf16>(gelu_gate * up);
           out[in_base + i]     = result;
@@ -309,40 +313,37 @@ inline void dequant_and_gelu_mul(sycl::queue& q,
 }
 
 // Merged: dequant INT32 → BF16, then apply NeoX RoPE in-place.
-// Input: INT32 accumulator [M, N], scale_token[M], scale_channel[N]
-// cos_sin_cache: [M, N] interleaved cos/sin (same layout as xe_fuse::standalone::rope)
-// Output: BF16 [M, N] with RoPE applied
+// Input: INT32 accumulator [L, M, N], scale_token[L*M], scale_channel[L*N]
+// cos_sin_cache: [L, M, N] interleaved cos/sin
+// Output: BF16 [L, M, N] with RoPE applied
 inline void dequant_and_rotary_embedding(sycl::queue& q,
                                           bf16*         out,
                                           int32_t const* acc,
                                           float const*  scale_token,
                                           float const*  scale_channel,
                                           float const*  cos_sin_cache,
-                                          int M, int N) {
-  int64_t total = static_cast<int64_t>(M) * N;
-  q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
+                                          int M, int N, int L = 1) {
+  q.parallel_for(sycl::range<1>(static_cast<size_t>(M) * N * L), [=](sycl::id<1> idx) {
     int64_t i    = idx[0];
+    int l        = static_cast<int>(i / (M * N));
+    int row      = static_cast<int>((i / N) % M);
     int col      = static_cast<int>(i % N);
-    int row      = static_cast<int>(i / N);
-    int64_t base = static_cast<int64_t>(row) * N;
-    float st     = scale_token[row];
+    int64_t base = static_cast<int64_t>(l) * M * N + static_cast<int64_t>(row) * N;
+    float st     = scale_token[l * M + row];
 
     int even_col = col & ~1;
     int odd_col  = even_col + 1;
     if (odd_col >= N) {
-      out[i] = static_cast<bf16>(static_cast<float>(acc[i]) * st * scale_channel[col]);
+      out[i] = static_cast<bf16>(static_cast<float>(acc[i]) * st * scale_channel[l * N + col]);
       return;
     }
-    float x_even = static_cast<float>(acc[base + even_col]) * st * scale_channel[even_col];
-    float x_odd  = static_cast<float>(acc[base + odd_col])  * st * scale_channel[odd_col];
+    float x_even = static_cast<float>(acc[base + even_col]) * st * scale_channel[l * N + even_col];
+    float x_odd  = static_cast<float>(acc[base + odd_col])  * st * scale_channel[l * N + odd_col];
     float cos_val = cos_sin_cache[base + even_col];
     float sin_val = cos_sin_cache[base + odd_col];
-    float result;
-    if ((col & 1) == 0)
-      result = x_even * cos_val + x_odd * sin_val;
-    else
-      result = -x_even * sin_val + x_odd * cos_val;
-    out[i] = static_cast<bf16>(result);
+    out[i] = static_cast<bf16>((col & 1) == 0
+        ?  x_even * cos_val + x_odd * sin_val
+        : -x_even * sin_val + x_odd * cos_val);
   });
 }
 
