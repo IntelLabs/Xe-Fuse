@@ -170,7 +170,8 @@ static void ref_float_gemm_acc(sycl::queue& q, float* acc,
   });
 }
 
-// out[l,m,n] = bf16(acc[l,m,n] * scale_tok[l*M+m] * scale_ch[l*N+n])
+// out[l,m,n] = bf16(acc[l,m,n] * scale_tok[l*M+m] * scale_ch[n])
+// scale_ch is shared across batches (same weights for all L slices)
 static void ref_apply_dequant(sycl::queue& q, bf16* out, float const* acc,
     float const* scale_tok, float const* scale_ch, int M, int N, int L) {
   q.parallel_for(sycl::range<1>(static_cast<size_t>(M) * N * L), [=](sycl::id<1> idx) {
