@@ -23,7 +23,7 @@ void launch_compute_rstd(
   q.submit([&](sycl::handler& cgh) {
     cgh.parallel_for(
       sycl::nd_range<1>(work_groups * SG_SIZE, SG_SIZE),
-      [=](sycl::nd_item<1> item) {
+      [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
         int row = item.get_group(0);
         int lane = item.get_local_id(0);
 
@@ -79,7 +79,7 @@ void launch_compute_rstd_and_quantize(
   q.submit([&](sycl::handler& cgh) {
     cgh.parallel_for(
       sycl::nd_range<1>(static_cast<size_t>(work_groups) * SG_SIZE, SG_SIZE),
-      [=](sycl::nd_item<1> item) {
+      [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
         int row  = item.get_group(0);
         int lane = item.get_local_id(0);
 

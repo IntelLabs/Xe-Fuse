@@ -29,6 +29,7 @@ def generate_pipeline_cpp(
     seq_len: int = 2048,
     autotune: bool = False,
     int8_mode: str = "none",
+    quaRot: bool = False,
 ) -> str:
     if int8_mode == "w8a8":
         template_path = Path(__file__).parent / "pipeline_w8a8_template.cpp.j2"
@@ -83,6 +84,7 @@ def generate_pipeline_cpp(
         gated_ffn=config["gated_ffn"],
         pipeline_desc=" -> ".join(pipeline_parts),
         int8_mode=int8_mode,
+        quaRot=(quaRot and int8_mode == "w8a8"),
         **tile_vars,
     )
 
@@ -114,6 +116,12 @@ def main():
         help="INT8 quantization mode: none=BF16 pipeline (default), w8a8=W8A8 INT8 pipeline",
     )
     parser.add_argument(
+        "--quaRot",
+        action="store_true",
+        help="Enable QuaRot Hadamard rotation for W8A8 (requires --int8-mode w8a8): "
+             "K0 epilogue applies in-register WHT to output activations",
+    )
+    parser.add_argument(
         "--list-presets",
         action="store_true",
         help="List available model presets and exit",
@@ -140,7 +148,7 @@ def main():
 
     code = generate_pipeline_cpp(
         config, preset_name, seq_len=args.seq_len, autotune=args.autotune,
-        int8_mode=args.int8_mode,
+        int8_mode=args.int8_mode, quaRot=args.quaRot,
     )
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)

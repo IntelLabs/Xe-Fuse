@@ -32,8 +32,7 @@ using bf16 = cutlass::bfloat16_t;
 // vectorized variance accumulation, work-group reduction via SLM.
 inline void rms_norm(sycl::queue& q, bf16* out, bf16 const* input,
                      bf16 const* weight, int M, int N, float eps = 1e-6f) {
-  int wg_size = std::min(N / 8, 256);
-  if (wg_size < 1) wg_size = std::min(N, 256);
+  int wg_size = std::min(256, ((std::max(N / 8, 1) + 15) / 16) * 16);
 
   q.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> s_var(sycl::range<1>(1), cgh);
@@ -76,8 +75,7 @@ inline void rms_norm(sycl::queue& q, bf16* out, bf16 const* input,
 inline void fused_add_rms_norm(sycl::queue& q, bf16* input, bf16* residual,
                                 bf16 const* weight, int M, int N,
                                 float eps = 1e-6f) {
-  int wg_size = std::min(N / 8, 256);
-  if (wg_size < 1) wg_size = std::min(N, 256);
+  int wg_size = std::min(256, ((std::max(N / 8, 1) + 15) / 16) * 16);
 
   q.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> s_var(sycl::range<1>(1), cgh);
