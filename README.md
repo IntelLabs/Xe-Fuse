@@ -147,6 +147,9 @@ using Gemm = typename Kernel::Gemm;
 |-------|---------|-------|
 | `DequantW8A8<TS, EScale>` | `int32_acc * scale_token[m] * scale_channel[n]` | INT8 GEMM → bf16 output |
 | `DequantW8A8Biased<TS, EScale, EBias>` | `... + bias[n]` | Same with per-channel bias |
+| `DequantRoPE<TS, EScl, ECS>` | dequant → RoPE rotation | K4 W8A8: Q/K projections |
+| `DequantSwiGLU<TS, EScl>` | dequant → `silu(gate) * up` on adjacent pairs | K2 W8A8: FFN (LLaMA-style) |
+| `DequantGeGLU<TS, EScl>` | dequant → `gelu(gate) * up` on adjacent pairs | K2 W8A8: FFN (Gemma-style) |
 
 INT8 GEMM uses `int8_t` A/B inputs, `int32_t` accumulator, `bf16` output, and `AlignmentAB=32`
 for 256-bit INT8 loads via the `XE_8x16x32_S32S8S8S32_TT` MMA atom.
@@ -281,6 +284,90 @@ each expert gets its own scale vector and SwiGLU activation without extra launch
 | Mixtral 8x22B | 6144 | 16384 | 8 | 2 | 32768×6144 |
 | DeepSeek-V3 | 7168 | 2048 | 256 | 8 | 4096×7168 |
 | DBRX | 6144 | 10752 | 16 | 4 | 21504×6144 |
+
+## W8A8 INT8 Quantization Pipeline
+
+W8A8 quantizes both weights (W) and activations (A) to INT8, then dequantizes inside the GEMM epilogue — the INT32 accumulator never touches global memory. Compared to BF16 this doubles arithmetic intensity and reaches the higher INT8 TOPS ceiling on BMG-G31.
+
+### High-level kernel structs
+
+Three ready-to-use kernel structs in `include/xe-fuse/kernels/`:
+
+```cpp
+#include "xe-fuse/kernels/gemm_dequant_w8a8.hpp"
+#include "xe-fuse/kernels/gemm_dequant_rope.hpp"
+#include "xe-fuse/kernels/gemm_dequant_swiglu.hpp"
+
+// K0/K1: plain dequant (O and V projections)
+using K0 = xe_fuse::GemmDequantW8A8<>;
+auto evt = K0::make_evt_args(scale_token, M, scale_channel, N);
+
+// K4: dequant + RoPE (Q projection)
+using K4 = xe_fuse::GemmDequantRoPE<>;
+auto stride_cs = cutlass::make_cute_packed_stride(K4::StrideCosSin{}, make_shape(M, N, L));
+auto evt = K4::make_evt_args(scale_token, M, scale_channel, N, cos_sin, stride_cs);
+
+// K2: dequant + SwiGLU (FFN — LLaMA/Mistral/Qwen)
+// For GeGLU (Gemma), use GemmDequantGeGLU<> instead
+using K2 = xe_fuse::GemmDequantSwiGLU<>;
+auto evt = K2::make_evt_args(scale_token, M, scale_channel, N);
+```
+
+Strides must be derived from the kernel's own types — CUTLASS XE StrideB has a compile-time leading element that differs from StrideA:
+
+```cpp
+using StrideA = typename K0::Gemm::GemmKernel::StrideA;
+using StrideB = typename K0::Gemm::GemmKernel::StrideB;
+auto sA = cutlass::make_cute_packed_stride(StrideA{}, make_shape(M, K, L));
+auto sB = cutlass::make_cute_packed_stride(StrideB{}, make_shape(N, K, L));  // N first
+```
+
+### Activation quantization
+
+`launch_compute_rstd_and_quantize` combines RMSNorm and INT8 quantization in a single 3-pass subgroup kernel. The resulting `scale_token[m]` absorbs the RMSNorm reciprocal std — the GEMM epilogue multiplies by it directly with no separate normalization kernel needed:
+
+```cpp
+#include "xe-fuse/kernels/compute_rstd.hpp"
+
+// x[M,N] → x_i8[M,N] + scale_token[M]
+// scale_token[m] = max_n|x*rstd| / 127  (absorbs rstd into quant scale)
+xe_fuse::launch_compute_rstd_and_quantize(q, x, x_i8, scale_token, M, N, L, eps);
+```
+
+### Standalone INT8 ops (for baselines)
+
+```cpp
+#include "xe-fuse/standalone/ops.hpp"
+#include "xe-fuse/standalone/vllm_ops.hpp"
+
+// Naive: separate dequant then op
+xe_fuse::standalone::dequant_w8a8(q, out, i32_acc, scale_token, scale_channel, M, N, L);
+
+// vllm_int8_equiv: merged dequant + op in one kernel
+xe_fuse::vllm_equiv::dequant_and_rotary_embedding(q, out, i32_acc, st, sc, cos_sin, M, N);
+xe_fuse::vllm_equiv::dequant_and_silu_mul(q, out, i32_acc, st, sc, I, M);
+xe_fuse::vllm_equiv::dequant_and_gelu_mul(q, out, i32_acc, st, sc, I, M);
+```
+
+### Three-way pipeline benchmark
+
+`generate_pipeline.py --int8-mode w8a8` generates a benchmark comparing three implementations across the full attention+FFN pipeline:
+
+| Variant | Description |
+|---------|-------------|
+| `XE_W8A8_FUSED` | INT8 GEMM with fused dequant epilogue — INT32 acc stays in registers |
+| `VLLM_INT8_EQUIV` | INT8 GEMM (INT32 to DRAM) + merged dequant+op kernels |
+| `NAIVE_INT8` | INT8 GEMM (INT32 to DRAM) + separate dequant + separate ops |
+
+```bash
+# Generate C++ for a model preset
+python3 autotune/generate_pipeline.py --preset llama3_8b --int8-mode w8a8 -o /tmp/w8a8.cpp
+
+# Or run via sbatch (correctness check + benchmarks at multiple sequence lengths):
+sbatch tests/run_w8a8_pipeline.sh llama3_8b
+```
+
+At `--iterations=0` the binary runs a per-kernel float reference comparison and exits without benchmarking.
 
 ## Autotune Tile Selection
 

@@ -28,8 +28,13 @@ def generate_pipeline_cpp(
     preset_name: str = "custom",
     seq_len: int = 2048,
     autotune: bool = False,
+    int8_mode: str = "none",
+    quaRot: bool = False,
 ) -> str:
-    template_path = Path(__file__).parent / "pipeline_template.cpp.j2"
+    if int8_mode == "w8a8":
+        template_path = Path(__file__).parent / "pipeline_w8a8_template.cpp.j2"
+    else:
+        template_path = Path(__file__).parent / "pipeline_template.cpp.j2"
 
     if not template_path.exists():
         print(f"ERROR: Template not found at {template_path}", file=sys.stderr)
@@ -78,6 +83,8 @@ def generate_pipeline_cpp(
         ffn_activation=config["ffn_activation"],
         gated_ffn=config["gated_ffn"],
         pipeline_desc=" -> ".join(pipeline_parts),
+        int8_mode=int8_mode,
+        quaRot=(quaRot and int8_mode == "w8a8"),
         **tile_vars,
     )
 
@@ -101,6 +108,18 @@ def main():
         type=int,
         default=2048,
         help="Target sequence length for tile selection (default: 2048)",
+    )
+    parser.add_argument(
+        "--int8-mode",
+        choices=["none", "w8a8"],
+        default="none",
+        help="INT8 quantization mode: none=BF16 pipeline (default), w8a8=W8A8 INT8 pipeline",
+    )
+    parser.add_argument(
+        "--quaRot",
+        action="store_true",
+        help="Enable QuaRot Hadamard rotation for W8A8 (requires --int8-mode w8a8): "
+             "K0 epilogue applies in-register WHT to output activations",
     )
     parser.add_argument(
         "--list-presets",
@@ -128,7 +147,8 @@ def main():
         return
 
     code = generate_pipeline_cpp(
-        config, preset_name, seq_len=args.seq_len, autotune=args.autotune
+        config, preset_name, seq_len=args.seq_len, autotune=args.autotune,
+        int8_mode=args.int8_mode, quaRot=args.quaRot,
     )
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -141,6 +161,7 @@ def main():
     print(
         f"  Dims:   H={config['H']}, H_kv={config['H_kv']}, I={config['I']}, N_ffn={n_ffn}"
     )
+    print(f"  Mode:   {args.int8_mode.upper() if args.int8_mode != 'none' else 'BF16'}")
     print(f"  Q/K:    {'K4 (RMSNorm+RoPE)' if config['use_rope'] else 'K1 (RMSNorm)'}")
     print(f"  FFN:    {config['ffn_activation']}")
     if args.autotune:

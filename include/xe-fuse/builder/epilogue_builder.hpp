@@ -43,6 +43,7 @@
 #include <cute/tensor.hpp>
 
 #include "xe-fuse/visitors/xe_elementwise_compute.hpp"
+#include "xe-fuse/visitors/xe_hadamard_compute.hpp"
 #include "xe-fuse/visitors/xe_pairwise_compute.hpp"
 #include "xe-fuse/visitors/xe_rope_compute.hpp"
 #include "xe-fuse/visitors/xe_scalerows_compute.hpp"
@@ -255,6 +256,40 @@ using DequantW8A8Biased = Add<
     DequantW8A8<TileShape, ElementScale, ElementCompute>,
     RowBroadcast<2, TileShape, ElementBias, ElementCompute>,
     ElementCompute, ElementCompute>;
+
+// DequantRoPE: dequant(int32_acc) + RoPE  — K4_W8A8 (Q/K projections)
+// scale_token[m] absorbs both the per-token quantization range and the RMSNorm
+// reciprocal std, so no separate RMSNorm multiply is needed in the epilogue.
+// Tree: XeRoPEComputeTwoChild( DequantW8A8, AuxLoad<cos_sin> )
+template <typename TileShape,
+          typename ElementScale = float, typename ElementCosSin = float,
+          typename ElementCompute = float>
+using DequantRoPE = RoPEComposed<DequantW8A8<TileShape, ElementScale, ElementCompute>,
+                                 ElementCosSin>;
+
+// DequantSwiGLU: dequant(int32_acc) + SwiGLU  — K2_W8A8 (FFN, SwiGLU models)
+// Tree: XePairwiseCompute<SwiGLUFn>( DequantW8A8 )
+template <typename TileShape,
+          typename ElementScale = float, typename ElementCompute = float>
+using DequantSwiGLU = SwiGLU<DequantW8A8<TileShape, ElementScale, ElementCompute>>;
+
+// DequantGeGLU: dequant(int32_acc) + GeGLU  — K2_W8A8 (FFN, Gemma-style models)
+// Tree: XePairwiseCompute<GeGLUFn>( DequantW8A8 )
+template <typename TileShape,
+          typename ElementScale = float, typename ElementCompute = float>
+using DequantGeGLU = GeGLU<DequantW8A8<TileShape, ElementScale, ElementCompute>>;
+
+// HadamardOutput<InnerEVT, GroupSize>: apply WHT to the output of InnerEVT
+//
+// Used as the final epilogue step in K0_W8A8 (O-projection) for QuaRot:
+//   K0_W8A8 epilogue: DequantW8A8(acc) → add_residual → gamma → HadamardOutput → BF16
+//
+// The rotated BF16 activations written to DRAM are ready for the next layer's
+// launch_compute_rstd_and_quantize without a separate Hadamard kernel.
+//
+// Tree: XeEVT<XeHadamardCompute<GroupSize>, InnerEVT>
+template <typename InnerEVT, int GroupSize = 16>
+using HadamardOutput = EVT<XeHadamardCompute<GroupSize>, InnerEVT>;
 
 // ============================================================
 // Auxiliary Store — write intermediate results to a buffer

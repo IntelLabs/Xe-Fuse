@@ -1,6 +1,13 @@
 #pragma once
 
 // vllm-equivalent standalone kernels for xe-fuse comparison benchmarks.
+// Includes merged INT8 dequant + op kernels for the vllm_int8_equiv comparison.
+// These represent what a well-implemented INT8 inference engine would do:
+// one kernel that reads the INT32 GEMM accumulator and applies dequant + activation
+// without a separate DRAM round-trip for the dequant output.
+//
+// xe-fuse W8A8 goes one step further: the INT32 accumulator never reaches DRAM
+// (dequant + activation happen directly in the GEMM epilogue registers).
 //
 // These re-implement the algorithmic patterns from vllm-xpu-kernels
 // (csrc/layernorm.cpp, csrc/activation.cpp, csrc/pos_encoding_kernels.cpp)
@@ -12,6 +19,7 @@
 //   vllm:    bare GEMM → separate fused standalone kernel → bare GEMM → ...
 //   xe-fuse: GEMM + epilogue fusion (ops run on register data)
 
+#include <cstdint>
 #include <sycl/sycl.hpp>
 #include "cutlass/bfloat16.h"
 
@@ -24,8 +32,7 @@ using bf16 = cutlass::bfloat16_t;
 // vectorized variance accumulation, work-group reduction via SLM.
 inline void rms_norm(sycl::queue& q, bf16* out, bf16 const* input,
                      bf16 const* weight, int M, int N, float eps = 1e-6f) {
-  int wg_size = std::min(N / 8, 256);
-  if (wg_size < 1) wg_size = std::min(N, 256);
+  int wg_size = std::min(256, ((std::max(N / 8, 1) + 15) / 16) * 16);
 
   q.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> s_var(sycl::range<1>(1), cgh);
@@ -68,8 +75,7 @@ inline void rms_norm(sycl::queue& q, bf16* out, bf16 const* input,
 inline void fused_add_rms_norm(sycl::queue& q, bf16* input, bf16* residual,
                                 bf16 const* weight, int M, int N,
                                 float eps = 1e-6f) {
-  int wg_size = std::min(N / 8, 256);
-  if (wg_size < 1) wg_size = std::min(N, 256);
+  int wg_size = std::min(256, ((std::max(N / 8, 1) + 15) / 16) * 16);
 
   q.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> s_var(sycl::range<1>(1), cgh);
@@ -217,6 +223,125 @@ inline void rotary_embedding(sycl::queue& q, bf16* query, bf16* key,
           }
         }
       });
+  });
+}
+
+// ── INT8 merged dequant + op kernels (vllm_int8_equiv comparison) ────────────
+//
+// These read INT32 GEMM accumulator output from DRAM, apply W8A8 dequantization
+// and the activation op in one pass, and write BF16 output.
+//
+// Compared to naive_int8 (separate dequant_w8a8 + separate op kernel):
+//   - One kernel launch instead of two
+//   - INT32 accumulator read once instead of write+read
+// Compared to xe-fuse W8A8:
+//   - INT32 accumulator still reaches DRAM (written by bare INT8 GEMM)
+//   - xe-fuse keeps it in registers throughout the GEMM epilogue
+
+// Merged: dequant INT32 → BF16, then apply SwiGLU
+// Input layout: [L, M, 2*d] INT32 (gate interleaved with up)
+// Output layout: [L, M, 2*d] BF16 (both lanes carry the same silu(gate)*up value)
+inline void dequant_and_silu_mul(sycl::queue& q,
+                                  bf16*         out,
+                                  int32_t const* acc,
+                                  float const*  scale_token,
+                                  float const*  scale_channel,
+                                  int d, int M, int L = 1) {
+  int N = 2 * d;
+  int wg_size = std::min(d, 1024);
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+      sycl::nd_range<1>(static_cast<size_t>(M) * L * wg_size, wg_size),
+      [=](sycl::nd_item<1> item) {
+        int grp = item.get_group(0);
+        int l   = grp / M;
+        int row = grp % M;
+        int lid = item.get_local_id(0);
+        int lsz = item.get_local_range(0);
+        int64_t in_base = (static_cast<int64_t>(l) * M + row) * N;
+        float st = scale_token[l * M + row];
+
+        for (int i = lid; i < d; i += lsz) {
+          float gate = static_cast<float>(acc[in_base + i])
+                     * st * scale_channel[l * N + i];
+          float up   = static_cast<float>(acc[in_base + d + i])
+                     * st * scale_channel[l * N + d + i];
+          float silu_gate = gate / (1.0f + sycl::exp(-gate));
+          bf16  result    = static_cast<bf16>(silu_gate * up);
+          out[in_base + i]     = result;
+          out[in_base + d + i] = result;
+        }
+      });
+  });
+}
+
+// Merged: dequant INT32 → BF16, then apply GeGLU
+inline void dequant_and_gelu_mul(sycl::queue& q,
+                                  bf16*         out,
+                                  int32_t const* acc,
+                                  float const*  scale_token,
+                                  float const*  scale_channel,
+                                  int d, int M, int L = 1) {
+  int N = 2 * d;
+  int wg_size = std::min(d, 1024);
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+      sycl::nd_range<1>(static_cast<size_t>(M) * L * wg_size, wg_size),
+      [=](sycl::nd_item<1> item) {
+        int grp = item.get_group(0);
+        int l   = grp / M;
+        int row = grp % M;
+        int lid = item.get_local_id(0);
+        int lsz = item.get_local_range(0);
+        int64_t in_base = (static_cast<int64_t>(l) * M + row) * N;
+        float st = scale_token[l * M + row];
+
+        for (int i = lid; i < d; i += lsz) {
+          float gate = static_cast<float>(acc[in_base + i])
+                     * st * scale_channel[l * N + i];
+          float up   = static_cast<float>(acc[in_base + d + i])
+                     * st * scale_channel[l * N + d + i];
+          float gelu_gate = gate * 0.5f * (1.0f + sycl::erf(gate * 0.7071067811865475f));
+          bf16  result    = static_cast<bf16>(gelu_gate * up);
+          out[in_base + i]     = result;
+          out[in_base + d + i] = result;
+        }
+      });
+  });
+}
+
+// Merged: dequant INT32 → BF16, then apply NeoX RoPE in-place.
+// Input: INT32 accumulator [L, M, N], scale_token[L*M], scale_channel[L*N]
+// cos_sin_cache: [L, M, N] interleaved cos/sin
+// Output: BF16 [L, M, N] with RoPE applied
+inline void dequant_and_rotary_embedding(sycl::queue& q,
+                                          bf16*         out,
+                                          int32_t const* acc,
+                                          float const*  scale_token,
+                                          float const*  scale_channel,
+                                          float const*  cos_sin_cache,
+                                          int M, int N, int L = 1) {
+  q.parallel_for(sycl::range<1>(static_cast<size_t>(M) * N * L), [=](sycl::id<1> idx) {
+    int64_t i    = idx[0];
+    int l        = static_cast<int>(i / (M * N));
+    int row      = static_cast<int>((i / N) % M);
+    int col      = static_cast<int>(i % N);
+    int64_t base = static_cast<int64_t>(l) * M * N + static_cast<int64_t>(row) * N;
+    float st     = scale_token[l * M + row];
+
+    int even_col = col & ~1;
+    int odd_col  = even_col + 1;
+    if (odd_col >= N) {
+      out[i] = static_cast<bf16>(static_cast<float>(acc[i]) * st * scale_channel[l * N + col]);
+      return;
+    }
+    float x_even = static_cast<float>(acc[base + even_col]) * st * scale_channel[l * N + even_col];
+    float x_odd  = static_cast<float>(acc[base + odd_col])  * st * scale_channel[l * N + odd_col];
+    float cos_val = cos_sin_cache[base + even_col];
+    float sin_val = cos_sin_cache[base + odd_col];
+    out[i] = static_cast<bf16>((col & 1) == 0
+        ?  x_even * cos_val + x_odd * sin_val
+        : -x_even * sin_val + x_odd * cos_val);
   });
 }
 
