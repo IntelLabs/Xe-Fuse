@@ -16,9 +16,11 @@
 #include "sycl_common.hpp"
 #include "helper.h"
 
+#include <algorithm>
 #include <random>
 #include <cmath>
 #include <iostream>
+#include <vector>
 
 using namespace cute;
 namespace b = xe_fuse::builder;
@@ -106,6 +108,11 @@ int main(int argc, const char** argv) {
     std::cout << "Disposition: skipped" << std::endl;
   }
 {% else %}
+  // Never silently pass: a skipped check is not a passed check.
+  if (opts.verify) {
+    std::cout << "Disposition: verify not implemented for this preset" << std::endl;
+    return 2;
+  }
   std::cout << "Disposition: skipped (no reference)" << std::endl;
 {% endif %}
 

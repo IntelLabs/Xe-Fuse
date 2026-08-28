@@ -52,6 +52,7 @@ PRESETS = {
         "name": "K1_RmsNorm",
         "evt_description": "D = acc * R[m]",
         "tile_shape": "_256, _256, _32",
+        "verify_epilogue": "scale_rows",
         "evt_typedefs": "using EVT = b::ScaleRows<b::Acc, TileShape, float>;",
         "aux_data": [
             {"name": "scale", "type": "float", "shape": "M * L", "init_seed": 42}
@@ -203,6 +204,7 @@ PRESETS = {
         "name": "K2_RmsNormSwiGLU",
         "evt_description": "D = SwiGLU(acc * R[m])",
         "tile_shape": "_256, _256, _32",
+        "verify_epilogue": "scale_rows_swiglu",
         "evt_typedefs": "using EVT = b::SwiGLU<b::ScaleRows<b::Acc, TileShape, float>>;",
         "aux_data": [
             {"name": "scale", "type": "float", "shape": "M * L", "init_seed": 42}
@@ -226,6 +228,7 @@ PRESETS = {
         "name": "K2_RmsNormGeGLU",
         "evt_description": "D = GeGLU(acc * R[m])",
         "tile_shape": "_256, _256, _32",
+        "verify_epilogue": "scale_rows_geglu",
         "evt_typedefs": "using EVT = b::GeGLU<b::ScaleRows<b::Acc, TileShape, float>>;",
         "aux_data": [
             {"name": "scale", "type": "float", "shape": "M * L", "init_seed": 42}
@@ -249,6 +252,7 @@ PRESETS = {
         "name": "K1v2_ScaleRowsMerged",
         "evt_description": "D = acc * R[m] via merged visitor (flat tree)",
         "tile_shape": "_256, _256, _32",
+        "verify_epilogue": "scale_rows",
         "evt_typedefs": "using EVT = b::ScaleRowsMerged<TileShape, float>;",
         "aux_data": [
             {"name": "scale", "type": "float", "shape": "M * L", "init_seed": 42}
@@ -270,6 +274,7 @@ PRESETS = {
         "name": "K2v2_SwiGLUScaled",
         "evt_description": "D = SwiGLU(acc * R[m]) via merged visitor (flat tree)",
         "tile_shape": "_256, _256, _32",
+        "verify_epilogue": "scale_rows_swiglu",
         "evt_typedefs": "using EVT = b::SwiGLUScaled<TileShape, float>;",
         "aux_data": [
             {"name": "scale", "type": "float", "shape": "M * L", "init_seed": 42}
@@ -291,6 +296,7 @@ PRESETS = {
         "name": "K2v2_GeGLUScaled",
         "evt_description": "D = GeGLU(acc * R[m]) via merged visitor (flat tree)",
         "tile_shape": "_256, _256, _32",
+        "verify_epilogue": "scale_rows_geglu",
         "evt_typedefs": "using EVT = b::GeGLUScaled<TileShape, float>;",
         "aux_data": [
             {"name": "scale", "type": "float", "shape": "M * L", "init_seed": 42}
@@ -407,6 +413,96 @@ PRESETS = {
 }
 
 
+# Host-side reference for --verify=1, keyed by a preset's "verify_epilogue".
+# All covered epilogues share the ScaleRows base: row = scale[m] * (A @ B)[m, :]
+# (fp64 accumulation on host). The value maps the row to D; None = identity
+# (compare every column). GLU entries give the pairwise expression over
+# (gate, up) = (even, odd) adjacent columns; the result lands in the even
+# columns of D, so only those are compared (verified empirically).
+VERIFY_ACTIVATIONS = {
+    "scale_rows": None,
+    "scale_rows_swiglu": "gate / (1.0 + std::exp(-gate)) * up",
+    "scale_rows_geglu": "gate * 0.5 * (1.0 + std::erf(gate * 0.7071067811865475)) * up",
+}
+
+
+def generate_verify_code(spec: dict) -> str | None:
+    """C++ body run under --verify=1: host-side EVT reference vs device D.
+
+    Returns None when the preset's epilogue has no host reference yet; the
+    caller must then emit a hard "verify not implemented" failure instead of
+    silently passing (a skipped check is not a passed check).
+    """
+    tag = spec.get("verify_epilogue")
+    if tag not in VERIFY_ACTIVATIONS:
+        return None
+    activation = VERIFY_ACTIVATIONS[tag]
+
+    elem_a = spec.get("element_a", "bf16")
+    elem_b = spec.get("element_b", "bf16")
+    elem_d = spec.get("element_d", "bf16")
+
+    lines = [
+        "// Host-side EVT reference (fp64 accumulate): D_ref = epilogue(scale[m] * (A @ B))",
+        f"std::vector<{elem_a}> host_A(block_A.size());",
+        f"std::vector<{elem_b}> host_B(block_B.size());",
+        f"std::vector<{elem_d}> host_D(block_D.size());",
+        "std::vector<float> host_scale(block_scale.size());",
+        "block_A.copy_to_host(host_A.data());",
+        "block_B.copy_to_host(host_B.data());",
+        "block_D.copy_to_host(host_D.data());",
+        "block_scale.copy_to_host(host_scale.data());",
+        "",
+        "// ~5% covers bf16 outputs plus fp32-vs-fp64 accumulation-order differences.",
+        "double const rel_tol = 5e-2;",
+        "double max_rel_err = 0.0;",
+        "for (int l = 0; l < L; ++l) {",
+        "  for (int mi = 0; mi < M; ++mi) {",
+        "    double const s = static_cast<double>(host_scale[static_cast<size_t>(l) * M + mi]);",
+        "    std::vector<double> row(N);",
+        "    for (int ni = 0; ni < N; ++ni) {",
+        "      double acc = 0.0;",
+        "      for (int ki = 0; ki < K; ++ki) {",
+        "        double const a = static_cast<double>(static_cast<float>(host_A[(static_cast<size_t>(l) * M + mi) * K + ki]));",
+        "        double const bv = static_cast<double>(static_cast<float>(host_B[(static_cast<size_t>(l) * K + ki) * N + ni]));",
+        "        acc += a * bv;",
+        "      }",
+        "      row[ni] = s * acc;",
+        "    }",
+        "    size_t const d_row = (static_cast<size_t>(l) * M + mi) * static_cast<size_t>(N);",
+    ]
+    if activation is None:
+        lines += [
+            "    for (int ni = 0; ni < N; ++ni) {",
+            "      double const ref = row[ni];",
+        ]
+    else:
+        lines += [
+            "    // GLU pairs adjacent columns — gate = even, up = odd — and the",
+            "    // result lands in the even columns of D; odd columns are not compared.",
+            "    for (int ni = 0; ni + 1 < N; ni += 2) {",
+            "      double const gate = row[ni];",
+            "      double const up = row[ni + 1];",
+            f"      double const ref = {activation};",
+        ]
+    lines += [
+        "      double const got = static_cast<double>(static_cast<float>(host_D[d_row + ni]));",
+        "      double const rel = std::abs(got - ref) / std::max(std::abs(ref), 1.0);",
+        "      max_rel_err = std::max(max_rel_err, rel);",
+        "    }",
+        "  }",
+        "}",
+        'printf("Max relative error: %.3e (rel_tol %.1e, |ref| clamped to 1 in denominator)\\n",',
+        "       max_rel_err, rel_tol);",
+        "if (max_rel_err > rel_tol) {",
+        '  std::cout << "Disposition: Failed" << std::endl;',
+        "  return 1;",
+        "}",
+        'std::cout << "Disposition: Passed" << std::endl;',
+    ]
+    return "\n".join("    " + line if line else "" for line in lines)
+
+
 def generate_aux_allocations(aux_data: list[dict]) -> str:
     lines = []
     type_map = {"float": "float", "bf16": "bf16", "int8": "int8_t", "int32": "int32_t"}
@@ -447,6 +543,8 @@ def generate_cpp(spec: dict, defaults: dict | None = None) -> str:
                     f"{align_ab}, {align_cd}"
                 )
 
+            verify_code = generate_verify_code(spec)
+
             return tmpl.render(
                 kernel_name=spec["name"],
                 timestamp=datetime.now().isoformat(),
@@ -460,7 +558,8 @@ def generate_cpp(spec: dict, defaults: dict | None = None) -> str:
                 default_k=defaults.get("k", 4096),
                 default_iterations=defaults.get("iterations", 200),
                 default_verify=defaults.get("verify", 0),
-                has_verify=False,
+                has_verify=verify_code is not None,
+                verify_code=verify_code or "",
                 element_a=elem_a,
                 element_b=elem_b,
                 element_d=elem_d,
@@ -503,6 +602,23 @@ def generate_cpp_inline(spec: dict, defaults: dict | None = None) -> str:
             f"{align_ab}, {align_cd}"
         )
 
+    verify_body = generate_verify_code(spec)
+    if verify_body is not None:
+        verify_block = f"""\
+  if (opts.verify) {{
+{verify_body}
+  }} else {{
+    std::cout << "Disposition: skipped" << std::endl;
+  }}"""
+    else:
+        # Never silently pass: a skipped check is not a passed check.
+        verify_block = """\
+  if (opts.verify) {
+    std::cout << "Disposition: verify not implemented for this preset" << std::endl;
+    return 2;
+  }
+  std::cout << "Disposition: skipped (no reference)" << std::endl;"""
+
     return f"""\
 // Auto-generated xe-fuse kernel benchmark
 // Kernel: {spec["name"]}
@@ -519,7 +635,10 @@ def generate_cpp_inline(spec: dict, defaults: dict | None = None) -> str:
 #include "sycl_common.hpp"
 #include "helper.h"
 
+#include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <vector>
 
 using namespace cute;
 namespace b = xe_fuse::builder;
@@ -600,7 +719,7 @@ int main(int argc, const char** argv) {{
   CUTLASS_CHECK(gemm_op.run());
   compat::wait();
 
-  std::cout << "Disposition: launched" << std::endl;
+{verify_block}
 
   if (opts.iterations > 0) {{
     GPU_Clock timer;
