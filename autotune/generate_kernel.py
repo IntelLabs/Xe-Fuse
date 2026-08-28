@@ -733,6 +733,13 @@ int main(int argc, const char** argv) {{
     return 1;
   }}
   CUTLASS_CHECK(gemm_op.initialize(arguments, workspace.get()));
+  // NOTE: run() takes an optional stream argument — under SYCL a sycl::queue*
+  // (gemm_universal_adapter.h: nullptr falls back to the compat default queue
+  // used here). Integration code copying this pattern should pass its
+  // framework's in-order queue (e.g. the queue backing torch's current XPU
+  // stream) and rely on queue ordering instead of adding per-op waits:
+  // measured end-to-end, per-op waits cost -2.52% while reusing the framework
+  // queue measured +0.56%.
   CUTLASS_CHECK(gemm_op.run());
   compat::wait();
 
