@@ -45,6 +45,23 @@ TILES = {
 }
 
 
+def _snap_tile_m(problem_m: int, tile_m: int, tile_n: int, tile_k: int) -> int:
+    """Snap tile_m to the instantiated tile_m closest to problem_m without
+    exceeding it, keeping the given tile_n/tile_k. Falls back to the smallest
+    instantiated tile_m when every candidate exceeds problem_m, and keeps
+    tile_m unchanged when no tile is instantiated for (tile_n, tile_k).
+    """
+    candidates = sorted(
+        int(key.split("x")[0])
+        for key in TILES
+        if key.split("x")[1:] == [str(tile_n), str(tile_k)]
+    )
+    if not candidates:
+        return tile_m
+    at_most = [tm for tm in candidates if tm <= problem_m]
+    return at_most[-1] if at_most else candidates[0]
+
+
 def select_tile(M: int, N: int, K: int, kernel: str = "bare", groups: int = 1) -> str:
     """Select optimal tile shape string for CUTLASS cute::Shape<>.
 
@@ -250,6 +267,15 @@ def select_tile(M: int, N: int, K: int, kernel: str = "bare", groups: int = 1) -
             tile_n = min(tile_n, 128)
         elif tile_m <= 128:
             tile_n = min(tile_n, 256)
+
+    # Measured on Wildcat Lake (k2 at N=9728 K=896): the tile's M dimension
+    # must track the problem M — undersized tile_m lost at M=32/64/128
+    # (e.g. 32x128 at M=128: 825 us vs 612 us for a tile_m=128 tile).
+    # For M >= 32, prefer the instantiated tile_m closest to the problem M
+    # without exceeding it, keeping the N/K tile dims chosen above.
+    # Skinny-M picks (M < 32) stay as sweep-validated, where tile_m > M wins.
+    if M >= 32:
+        tile_m = _snap_tile_m(M, tile_m, tile_n, tile_k)
 
     key = f"{tile_m}x{tile_n}x{tile_k}"
     return TILES.get(key, "_256, _256, _32")
