@@ -514,7 +514,24 @@ def generate_aux_allocations(aux_data: list[dict]) -> str:
         lines.append(
             f"  cutlass::DeviceAllocation<{ctype}> block_{name}(static_cast<size_t>({shape}));"
         )
-        lines.append(f"  initialize_block(block_{name}, {seed});")
+        if ctype == "float":
+            # initialize_block() on DeviceAllocation<float> leaves the buffer
+            # all zeros (measured: absmax 0.0), so fill host-side instead.
+            lines.extend(
+                [
+                    "  {",
+                    "    // initialize_block() leaves DeviceAllocation<float> buffers all-zero",
+                    "    // (measured absmax 0.0), letting output-vs-reference checks pass",
+                    f"    // trivially on D == 0 — fill block_{name} host-side instead.",
+                    f"    std::vector<float> host_{name}(block_{name}.size());",
+                    f"    for (size_t i = 0; i < host_{name}.size(); ++i)",
+                    f"      host_{name}[i] = 0.5f + 0.03f * static_cast<float>((i + {seed}) % 97);",
+                    f"    block_{name}.copy_from_host(host_{name}.data());",
+                    "  }",
+                ]
+            )
+        else:
+            lines.append(f"  initialize_block(block_{name}, {seed});")
     return "\n".join(lines)
 
 
@@ -764,6 +781,7 @@ def generate_standalone_cpp(spec: dict, defaults: dict | None = None) -> str:
 #include "helper.h"
 
 #include <iostream>
+#include <vector>
 
 using namespace cute;
 using bf16 = cutlass::bfloat16_t;
