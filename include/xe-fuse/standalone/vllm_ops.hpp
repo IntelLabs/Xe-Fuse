@@ -22,6 +22,8 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 #include "cutlass/bfloat16.h"
+#include "cutlass/detail/helper_macros.hpp"
+#include "cutlass/gpu_generics.h"
 
 namespace xe_fuse::vllm_equiv {
 
@@ -239,8 +241,9 @@ inline void rotary_embedding(sycl::queue& q, bf16* query, bf16* key,
 //   - xe-fuse keeps it in registers throughout the GEMM epilogue
 
 // Merged: dequant INT32 → BF16, then apply SwiGLU
-// Input layout: [L, M, 2*d] INT32 (gate interleaved with up)
-// Output layout: [L, M, 2*d] BF16 (both lanes carry the same silu(gate)*up value)
+// Input layout:  [L, M, 2*d] INT32 (gate and up interleaved: even=gate, odd=up)
+// Output layout: [L, M, 2*d] BF16 — both even and odd positions at index i carry
+//                silu(gate[i]) * up[i]; the caller reads only N/2 columns (even).
 inline void dequant_and_silu_mul(sycl::queue& q,
                                   bf16*         out,
                                   int32_t const* acc,
@@ -342,6 +345,117 @@ inline void dequant_and_rotary_embedding(sycl::queue& q,
     out[i] = static_cast<bf16>((col & 1) == 0
         ?  x_even * cos_val + x_odd * sin_val
         : -x_even * sin_val + x_odd * cos_val);
+  });
+}
+
+// Per-head RMSNorm for QK tensors.
+// Input/output layout: [M, num_heads * head_dim]
+// gamma: [head_dim] nullable (float)
+// One workgroup per (token, head) pair. SG_SIZE=16.
+inline void rms_norm_per_head(sycl::queue& q, bf16* out, bf16 const* input,
+                               float const* gamma,  // nullable
+                               int M, int num_heads, int head_dim,
+                               float eps = 1e-6f) {
+  constexpr int SG_SIZE = 16;
+  int work_groups    = M * num_heads;
+  int total_head_dim = num_heads * head_dim;
+  int elems_per_lane = head_dim / SG_SIZE;
+
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+      sycl::nd_range<1>(
+        static_cast<size_t>(work_groups) * SG_SIZE,
+        static_cast<size_t>(SG_SIZE)),
+      [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+        int wg   = static_cast<int>(item.get_group(0));
+        int tok  = wg / num_heads;
+        int head = wg % num_heads;
+        int lane = static_cast<int>(item.get_local_id(0));
+
+        int row_base = tok * total_head_dim + head * head_dim;
+        auto sg = item.get_sub_group();
+
+        // ── Pass 1: reduce sum_sq over head_dim ──────────────────────────
+        float sum_sq = 0.f;
+        for (int j = 0; j < elems_per_lane; ++j) {
+          int d = lane + j * SG_SIZE;
+          float v = static_cast<float>(input[row_base + d]);
+          sum_sq += v * v;
+        }
+        for (int off = SG_SIZE / 2; off > 0; off /= 2)
+          sum_sq += sycl::shift_group_left(sg, sum_sq, off);
+
+        float rstd = sycl::rsqrt(sum_sq / static_cast<float>(head_dim) + eps);
+        rstd = sycl::group_broadcast(sg, rstd, 0);
+
+        // ── Pass 2: normalize × gamma (if present), write bf16 ───────────
+        for (int j = 0; j < elems_per_lane; ++j) {
+          int d = lane + j * SG_SIZE;
+          float v = static_cast<float>(input[row_base + d]) * rstd;
+          if (gamma != nullptr)
+            v *= gamma[d];
+          out[row_base + d] = static_cast<bf16>(v);
+        }
+      });
+  });
+}
+
+// RoPE with interleaved cos/sin format matching xe-fuse convention.
+// Input/output: [M, num_heads * head_dim] in-place (reads from 'input', writes to 'out').
+// cos_sin: [M, head_dim] interleaved: even index = cos, odd index = sin.
+// One workgroup per (token, head). SG_SIZE=16.
+inline void rope_interleaved(sycl::queue& q, bf16* out, bf16 const* input,
+                              float const* cos_sin,
+                              int M, int num_heads, int head_dim) {
+  constexpr int SG_SIZE = 16;
+  int work_groups    = M * num_heads;
+  int total_head_dim = num_heads * head_dim;
+  int elems_per_lane = head_dim / SG_SIZE;
+
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+      sycl::nd_range<1>(
+        static_cast<size_t>(work_groups) * SG_SIZE,
+        static_cast<size_t>(SG_SIZE)),
+      [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+        int wg   = static_cast<int>(item.get_group(0));
+        int tok  = wg / num_heads;
+        int head = wg % num_heads;
+        int lane = static_cast<int>(item.get_local_id(0));
+
+        int row_base = tok * total_head_dim + head * head_dim;
+        int cs_base  = tok * head_dim;
+
+        bool is_even = (lane & 1) == 0;
+
+        for (int j = 0; j < elems_per_lane; ++j) {
+          int d = lane + j * SG_SIZE;
+
+          float v = static_cast<float>(input[row_base + d]);
+
+          // RoPE: interleave-shuffle with adjacent lane
+          uint32_t my_bits      = reinterpret_cast<const uint32_t&>(v);
+          uint32_t partner_bits = shfl_xor_sync(0xFFFFFFFF, my_bits, 1, 16);
+          float my_val      = reinterpret_cast<const float&>(my_bits);
+          float partner_val = reinterpret_cast<const float&>(partner_bits);
+
+          float cs_val = cos_sin[cs_base + d];
+          uint32_t cs_bits         = reinterpret_cast<const uint32_t&>(cs_val);
+          uint32_t partner_cs_bits = shfl_xor_sync(0xFFFFFFFF, cs_bits, 1, 16);
+          float partner_cs = reinterpret_cast<const float&>(partner_cs_bits);
+
+          float cos_val = is_even ? cs_val     : partner_cs;
+          float sin_val = is_even ? partner_cs : cs_val;
+
+          float result;
+          if (is_even)
+            result =  my_val * cos_val + partner_val * sin_val;
+          else
+            result = -partner_val * sin_val + my_val * cos_val;
+
+          out[row_base + d] = static_cast<bf16>(result);
+        }
+      });
   });
 }
 

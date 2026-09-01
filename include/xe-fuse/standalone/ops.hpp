@@ -353,4 +353,50 @@ inline void dequant_w8a8(sycl::queue& q,
   });
 }
 
+// Quantize already-normalized BF16 values to INT8.
+// (Use after rms_norm when INT8 output is also needed — 2-pass: max then write.)
+// scale_token_out[m] = max_n(|input[m,n]|) / 127
+// quant_out[m,n] = round(input[m,n] / scale_token) clamped to [-128, 127]
+inline void quantize_bf16_to_int8(sycl::queue& q,
+                                   bf16 const* input,
+                                   int8_t* quant_out,
+                                   float* scale_token_out,
+                                   int M, int N, int L = 1) {
+  constexpr int SG_SIZE = 16;
+  int work_groups = M * L;
+
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+      sycl::nd_range<1>(static_cast<size_t>(work_groups) * SG_SIZE, SG_SIZE),
+      [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+        int row  = item.get_group(0);
+        int lane = item.get_local_id(0);
+        auto sg  = item.get_sub_group();
+
+        // ── Pass 1: reduce max_abs ────────────────────────────────────────
+        float max_abs = 0.f;
+        for (int col = lane; col < N; col += SG_SIZE) {
+          float v = static_cast<float>(input[row * N + col]);
+          max_abs = sycl::fmax(max_abs, sycl::fabs(v));
+        }
+        for (int off = SG_SIZE / 2; off > 0; off /= 2)
+          max_abs = sycl::fmax(max_abs, sycl::shift_group_left(sg, max_abs, off));
+
+        float scale_tok = max_abs / 127.f + 1e-8f;
+        scale_tok = sycl::group_broadcast(sg, scale_tok, 0);
+
+        // ── Pass 2: write INT8 ────────────────────────────────────────────
+        for (int col = lane; col < N; col += SG_SIZE) {
+          float v    = static_cast<float>(input[row * N + col]);
+          float qval = sycl::round(v / scale_tok);
+          qval = sycl::fmin(sycl::fmax(qval, -128.f), 127.f);
+          quant_out[row * N + col] = static_cast<int8_t>(qval);
+        }
+
+        if (lane == 0)
+          scale_token_out[row] = scale_tok;
+      });
+  });
+}
+
 }  // namespace xe_fuse::standalone

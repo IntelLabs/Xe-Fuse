@@ -137,6 +137,29 @@ template <typename ElementResidual = cutlass::bfloat16_t,
           typename ElementCompute = float>
 using AddResidual = Add<Acc, AuxLoad<ElementResidual>, ElementCompute, ElementCompute>;
 
+// GateAcc: gate[m] * acc — per-token gate (ColBroadcast) applied to accumulator.
+// gate[m] is a scalar per output row; used before residual add in DiT blocks.
+template <typename TileShape,
+          typename ElementGate    = float,
+          typename ElementCompute = float>
+using GateAcc = Mul<ColBroadcast<0, TileShape, ElementGate, ElementCompute>,
+                    Acc,
+                    ElementCompute, ElementCompute>;
+
+// GateResidualGamma: gamma[n] * (gate[m] * acc + residual)  — K0g pattern.
+// Extends K0a with a per-token gate that modulates the GEMM output before
+// the residual add.  Used in FLUX.2-style DiT single-block transformer blocks.
+template <typename TileShape,
+          typename ElementResidual = cutlass::bfloat16_t,
+          typename ElementGate     = float,
+          typename ElementGamma    = float,
+          typename ElementCompute  = float>
+using GateResidualGamma = ScaleCols<
+    Add<GateAcc<TileShape, ElementGate, ElementCompute>,
+        AuxLoad<ElementResidual>,
+        ElementCompute, ElementCompute>,
+    TileShape, ElementGamma, ElementCompute>;
+
 // ============================================================
 // Pairwise Operations — lane-shuffle-based pair computations
 // ============================================================
@@ -278,6 +301,31 @@ using DequantSwiGLU = SwiGLU<DequantW8A8<TileShape, ElementScale, ElementCompute
 template <typename TileShape,
           typename ElementScale = float, typename ElementCompute = float>
 using DequantGeGLU = GeGLU<DequantW8A8<TileShape, ElementScale, ElementCompute>>;
+
+// DequantFP8: float_acc * scale_a[m] * scale_b[n] → bf16
+// FP8×FP8 GEMM dequantization. Identical EVT structure to DequantW8A8 but
+// ElementAcc is float (FP8 upcasts to FP16 before XMX, accumulates in float).
+// scale_a[m] = per-token input scale, scale_b[n] = per-channel weight scale.
+template <typename TileShape,
+          typename ElementScale = float, typename ElementCompute = float>
+using DequantFP8 = Mul<
+    Mul<Acc,
+        ColBroadcast<0, TileShape, ElementScale, ElementCompute>,
+        ElementCompute, ElementCompute>,
+    RowBroadcast<0, TileShape, ElementScale, ElementCompute>,
+    ElementCompute, ElementCompute>;
+
+// DequantFP8SwiGLU: SwiGLU( float_acc * scale_a[m] * scale_b[n] ) → bf16
+// FP8 FFN kernel (K2_FP8): gate+up projection with dequant and SwiGLU fused.
+template <typename TileShape,
+          typename ElementScale = float, typename ElementCompute = float>
+using DequantFP8SwiGLU = SwiGLU<DequantFP8<TileShape, ElementScale, ElementCompute>>;
+
+// DequantFP8GeGLU: GeGLU( float_acc * scale_a[m] * scale_b[n] ) → bf16
+// FP8 FFN kernel for Gemma-style models.
+template <typename TileShape,
+          typename ElementScale = float, typename ElementCompute = float>
+using DequantFP8GeGLU = GeGLU<DequantFP8<TileShape, ElementScale, ElementCompute>>;
 
 // HadamardOutput<InnerEVT, GroupSize>: apply WHT to the output of InnerEVT
 //
