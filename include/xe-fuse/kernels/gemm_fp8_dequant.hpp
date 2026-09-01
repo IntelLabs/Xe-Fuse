@@ -157,7 +157,8 @@ struct GemmFP8Dequant {
 // ─────────────────────────────────────────────────────────────────────────────
 // GemmFP8DequantSwiGLU — K2_FP8
 // D[m,n] = SwiGLU( acc[m,n] * scale_a[m] * scale_b[n] )
-// For FFN gate+up projections; SwiGLU contracts N→N/2 at output.
+// For FFN gate+up projections; output is N columns wide — each pair (2i, 2i+1)
+// carries the same silu(gate)*up value; caller consumes only N/2 (even columns).
 // ─────────────────────────────────────────────────────────────────────────────
 template <
   typename ElementA_       = cutlass::float_e4m3_t,

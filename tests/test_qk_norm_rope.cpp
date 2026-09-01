@@ -101,6 +101,7 @@ int main(int argc, const char** argv) {
 
     std::vector<ElementQ> h_ref(input_size);
     constexpr float eps = 1e-6f;
+    std::vector<float> normed(head_dim);
 
     for (int tok = 0; tok < M; ++tok) {
       for (int h = 0; h < num_heads; ++h) {
@@ -116,7 +117,6 @@ int main(int argc, const char** argv) {
         float rstd = 1.f / std::sqrt(sum_sq / head_dim + eps);
 
         // normalize + gamma
-        std::vector<float> normed(head_dim);
         for (int d = 0; d < head_dim; ++d)
           normed[d] = static_cast<float>(h_in[row_base + d]) * rstd * h_gamma[d];
 

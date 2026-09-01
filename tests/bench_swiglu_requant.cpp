@@ -108,8 +108,8 @@ int main(int argc, const char** argv) {
   for (int i = 0; i < warmup; ++i) {
     xe_fuse::standalone::swiglu(q, swiglu_work_naive.get(), M * L, N_ffn, 1);
     xe_fuse::standalone::compute_rstd(q, rstd_naive.get(),
-        block_post_swiglu.get(), M, d, L);
-    xe_fuse::standalone::quantize_activations(q, block_post_swiglu.get(),
+        swiglu_work_naive.get(), M, d, L);
+    xe_fuse::standalone::quantize_activations(q, swiglu_work_naive.get(),
         rstd_naive.get(), quant_naive.get(), scale_naive.get(), M, d, L);
   }
   compat::wait();
@@ -152,13 +152,13 @@ int main(int argc, const char** argv) {
   // ── Benchmark NAIVE ───────────────────────────────────────────────────────
   timer.start();
   for (int i = 0; i < iters; ++i) {
-    // swiglu: reads+writes [M, N_ffn] in-place
+    // swiglu: reads [M, N_ffn] in-place, writes SwiGLU result to first [M, d]
     xe_fuse::standalone::swiglu(q, swiglu_work_naive.get(), M * L, N_ffn, 1);
-    // rstd: reads [M, d] post-swiglu
+    // rstd: reads first [M, d] of swiglu output
     xe_fuse::standalone::compute_rstd(q, rstd_naive.get(),
-        block_post_swiglu.get(), M, d, L);
+        swiglu_work_naive.get(), M, d, L);
     // quantize: reads [M, d] twice + writes [M, d] int8
-    xe_fuse::standalone::quantize_activations(q, block_post_swiglu.get(),
+    xe_fuse::standalone::quantize_activations(q, swiglu_work_naive.get(),
         rstd_naive.get(), quant_naive.get(), scale_naive.get(), M, d, L);
   }
   compat::wait();
